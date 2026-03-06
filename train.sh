@@ -15,8 +15,8 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards "${VAL_SHARDS}" \
     --output_dir "${OUTPUT_DIR}/run${RUN_NUMBER}" \
-    --batch_size 6 \
-    --num_frozen 0 \
+    --batch_size 4 \
+    --num_decoder_block_frozen 0 \
     --lr_g 1e-5 \
     --lr_d 1e-5 \
     --max_train_steps 500000 \
@@ -26,7 +26,6 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_fm 1.0 \
     --lambda_multi_res_mel 15.0 \
     --lambda_global_rms 1.0 \
-    --lambda_d_msd 0.1 \
     --save_every 625 \
     --eval_every 125 \
     --log_every 2 \
