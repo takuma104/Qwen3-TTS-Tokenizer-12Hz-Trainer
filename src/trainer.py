@@ -1,5 +1,6 @@
 # coding=utf-8
 # SPDX-License-Identifier: Apache-2.0
+
 """
 Qwen3TTSTokenizerV2Decoder Fine-tuning Script
 
@@ -518,9 +519,33 @@ def create_model(args, accelerator):
 
 
 def create_discriminators(accelerator):
-    """Create MPD and SpecDiscriminator discriminators."""
-    mpd = HiFiGANMultiPeriodDiscriminator()
-    msd = SpecDiscriminator()  # STFT-based, 8-scale, 48kHz optimized
+    """
+    Create MPD and SpecDiscriminator discriminators.
+    Parameters ported from inworld-ai/tts (48kHz training)
+    """
+
+    mpd = HiFiGANMultiPeriodDiscriminator(
+        periods=[2, 3, 5, 7, 11],
+        max_downsample_channels=512,
+        channels=16,
+        channel_increasing_factor=4,
+    )
+
+    msd = SpecDiscriminator(
+        stft_params={
+            "fft_sizes": [78, 126, 206, 334, 542, 876, 1418, 2296],
+            "hop_sizes": [39, 63, 103, 167, 271, 438, 709, 1148],
+            "win_lengths": [78, 126, 206, 334, 542, 876, 1418, 2296],
+            "window": "hann_window",
+        },
+        in_channels=1,
+        out_channels=1,
+        kernel_sizes=[5, 3],
+        channels=32,
+        max_downsample_channels=512,
+        downsample_scales=[2, 2, 2],
+        use_weight_norm=True,
+    )
 
     mpd_params = sum(p.numel() for p in mpd.parameters())
     msd_params = sum(p.numel() for p in msd.parameters())

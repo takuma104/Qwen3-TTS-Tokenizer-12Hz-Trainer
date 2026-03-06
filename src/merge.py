@@ -1,6 +1,6 @@
 # coding=utf-8
-# Copyright 2026 The Alibaba Qwen team & Takuma Mori.
 # SPDX-License-Identifier: Apache-2.0
+
 """
 Merge trained DecoderBlock weights with base 24kHz model to create a 48kHz model.
 
