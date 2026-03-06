@@ -1091,7 +1091,7 @@ def main():
                         "g/loss_total": loss_g.item(),
                         "g/loss_multi_res_mel": loss_multi_res_mel.item(),
                         "g/loss_global_rms": loss_global_rms.item(),
-                        "lr/generator": scheduler_g.get_last_lr()[0],
+                        "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
                         "train/total_audio_hour": total_audio_sec / 3600.0,
                     }
@@ -1109,7 +1109,7 @@ def main():
                                 "d/dg_msd": dg_msd.item(),
                                 "g/loss_adv": loss_g_adv.item(),
                                 "g/loss_fm": loss_fm.item(),
-                                "lr/discriminator": scheduler_d.get_last_lr()[0],
+                                "train/lr/discriminator": scheduler_d.get_last_lr()[0],
                                 "gan/crop_len_samples": gan_crop_len_samples,
                                 "gan/crop_len_seconds": gan_crop_len_samples
                                 / target_sample_rate,
