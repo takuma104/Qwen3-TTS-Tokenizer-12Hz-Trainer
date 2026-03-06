@@ -1,0 +1,32 @@
+[project]
+name = "qwen3-tts-tokenizer-12hz-trainer"
+version = "0.0.1"
+description = "Qwen3 TTS Tokenizer 12Hz Trainer"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "transformers==4.57.3",
+  "accelerate==1.12.0",
+  "gradio",
+  "librosa",
+  "torchaudio",
+  "soundfile",
+  "sox",
+  "onnxruntime",
+  "einops",
+  "ipykernel",
+  "ipywidgets",
+  "flash-attn; sys_platform == 'linux'",
+  "pyarrow>=23.0.0",
+  "webdataset>=1.0.2",
+  "wandb>=0.24.1",
+  "tensorboard>=2.20.0",
+  "peft>=0.18.1",
+  "datasets>=4.5.0",
+  "black>=26.1.0",
+  "matplotlib>=3.10.8",
+  "qwen-tts>=0.1.1",
+]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
