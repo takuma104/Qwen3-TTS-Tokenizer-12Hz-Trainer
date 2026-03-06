@@ -1,0 +1,1086 @@
+# coding=utf-8
+# Copyright 2026 The Alibaba Qwen team & Takuma Mori.
+# SPDX-License-Identifier: Apache-2.0
+"""
+DecoderBlock Addition Method - 48kHz GAN Training Script
+
+Adds adversarial training (MPD + MSD) on top of reconstruction loss
+for improved perceptual quality of 48kHz audio generation.
+
+Expects a pre-trained generator checkpoint from reconstruction-only training (train.py).
+
+Usage:
+    # Single GPU
+    python finetuning/decoder_block_48k/train_gan.py \
+        --train_shards "data/train-{000000..000010}.tar" \
+        --resume_generator_from output/decoder_block_48k/run1/checkpoint-best \
+        --output_dir output/decoder_block_48k/run_gan1
+
+    # Multi-GPU (accelerate)
+    accelerate launch finetuning/decoder_block_48k/train_gan.py \
+        --train_shards "data/train-*.tar" \
+        --resume_generator_from output/decoder_block_48k/run1/checkpoint-best \
+        --output_dir output/decoder_block_48k/run_gan1
+"""
+
+import argparse
+import gc
+import glob
+import json
+import os
+import sys
+import warnings
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from safetensors.torch import load_file, save_file
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# Suppress MPS-backend STFT resize deprecation warning (PyTorch internal bug, harmless)
+warnings.filterwarnings(
+    "ignore",
+    message="An output with one or more elements was resized",
+    module="torch.functional",
+)
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from xcodec2.criterions import (
+    MultiResolutionMelSpectrogramLoss,
+)
+from xcodec2.module import (
+    HiFiGANMultiPeriodDiscriminator,
+    SpecDiscriminator,
+)
+from dataset import create_webdataset_loader
+from losses import (
+    global_rms_loss,
+    generator_adversarial_loss,
+    discriminator_loss,
+    feature_matching_loss,
+)
+from qwen_tts import Qwen3TTSTokenizer
+from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2DecoderConfig,
+)
+from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    Qwen3TTSTokenizerV2Decoder,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="GAN training for 48kHz decoder (DecoderBlock addition method)"
+    )
+
+    # Data
+    parser.add_argument(
+        "--train_shards",
+        type=str,
+        required=True,
+        help="WebDataset shard pattern for training data",
+    )
+    parser.add_argument(
+        "--val_shards",
+        type=str,
+        default=None,
+        help="WebDataset shard pattern for validation data",
+    )
+
+    # Model
+    parser.add_argument(
+        "--decoder_model_path",
+        type=str,
+        default="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+        help="Base 24kHz decoder model path",
+    )
+    parser.add_argument(
+        "--extra_upsample_rate",
+        type=int,
+        default=2,
+        help="Additional upsample rate to append (default: 2 for 48kHz)",
+    )
+    parser.add_argument(
+        "--num_frozen",
+        type=int,
+        default=None,
+        help="Number of decoder modules to freeze (default: base_num_decoder_modules - 2)",
+    )
+
+    # Generator checkpoint (warm-start from reconstruction-only training)
+    parser.add_argument(
+        "--resume_generator_from",
+        type=str,
+        default=None,
+        help="Path to reconstruction-only training checkpoint (e.g., run1/checkpoint-best)",
+    )
+
+    # Full GAN checkpoint resume
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Resume full GAN training from checkpoint",
+    )
+
+    # Training settings
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument(
+        "--lr_g", type=float, default=1e-4, help="Generator learning rate"
+    )
+    parser.add_argument(
+        "--lr_d", type=float, default=2e-4, help="Discriminator learning rate"
+    )
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=2,
+        help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping",
+    )
+
+    # GAN loss weights
+    parser.add_argument(
+        "--lambda_adv", type=float, default=1.0, help="Adversarial loss weight"
+    )
+    parser.add_argument(
+        "--lambda_fm", type=float, default=1.0, help="Feature matching loss weight"
+    )
+    parser.add_argument(
+        "--lambda_d_mpd", type=float, default=1.0, help="MPD discriminator loss weight"
+    )
+    parser.add_argument(
+        "--lambda_d_msd", type=float, default=1.0, help="MSD discriminator loss weight"
+    )
+    parser.add_argument(
+        "--gan_crop_seconds",
+        type=float,
+        default=2.0,
+        help="Crop length (seconds) for MPD/MSD inputs. 0 or less uses min valid length in batch.",
+    )
+    parser.add_argument(
+        "--lambda_multi_res_mel",
+        type=float,
+        default=15.0,
+        help="Multi-resolution mel loss weight (inworld-ai style, 7 scales). 0=disabled",
+    )
+    parser.add_argument(
+        "--lambda_global_rms",
+        type=float,
+        default=1.0,
+        help="Global dB RMS loss weight (inworld-ai style). 0=disabled",
+    )
+
+    # Data settings
+    parser.add_argument(
+        "--max_audio_length",
+        type=float,
+        default=5.0,
+        help="Maximum audio length (seconds)",
+    )
+    parser.add_argument(
+        "--min_audio_length",
+        type=float,
+        default=1.0,
+        help="Minimum audio length (seconds)",
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=0, help="Number of DataLoader workers"
+    )
+
+    # Output
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output/decoder_block_48k_gan",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--save_every", type=int, default=5000, help="Checkpoint save interval (steps)"
+    )
+    parser.add_argument(
+        "--eval_every", type=int, default=1000, help="Evaluation interval (steps)"
+    )
+    parser.add_argument(
+        "--log_every", type=int, default=10, help="Log output interval (steps)"
+    )
+
+    # Logging
+    parser.add_argument("--log_with", type=str, default="wandb", help="Logging method")
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="qwen3-tts-decoder-block-48k",
+        help="WandB project",
+    )
+    parser.add_argument(
+        "--wandb_run_name", type=str, default=None, help="WandB run name"
+    )
+    parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity")
+
+    # Other
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"]
+    )
+    parser.add_argument(
+        "--max_train_steps", type=int, default=None, help="Maximum training steps"
+    )
+
+    return parser.parse_args()
+
+
+def build_gan_crops(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    lengths_48k: torch.Tensor,
+    max_len: int,
+    crop_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, int, float]:
+    """Build fixed-length random crops for GAN losses, excluding padded regions."""
+    lengths = torch.clamp(lengths_48k, min=1, max=max_len).to(dtype=torch.long)
+    min_valid_len = int(lengths.min().item())
+    if crop_samples > 0:
+        crop_len = min(crop_samples, min_valid_len)
+    else:
+        crop_len = min_valid_len
+    crop_len = max(crop_len, 1)
+
+    pred_crops = []
+    target_crops = []
+    for i in range(pred.shape[0]):
+        valid_len = int(lengths[i].item())
+        max_start = valid_len - crop_len
+        if max_start > 0:
+            start = int(
+                torch.randint(0, max_start + 1, (1,), device=pred.device).item()
+            )
+        else:
+            start = 0
+        end = start + crop_len
+        pred_crops.append(pred[i, start:end])
+        target_crops.append(target[i, start:end])
+
+    pred_gan = torch.stack(pred_crops, dim=0)
+    target_gan = torch.stack(target_crops, dim=0)
+    padding_ratio = 1.0 - (
+        lengths.float().sum().item() / float(lengths.numel() * max_len)
+    )
+    return pred_gan, target_gan, crop_len, padding_ratio
+
+
+class DecoderTrainingWrapper(nn.Module):
+    """Wraps Qwen3TTSTokenizerV2Decoder for efficient training.
+
+    Runs frozen layers under torch.no_grad() to save VRAM,
+    and only computes gradients for the new decoder blocks.
+    """
+
+    def __init__(
+        self, decoder: Qwen3TTSTokenizerV2Decoder, num_frozen_decoder_modules: int
+    ):
+        super().__init__()
+        self.decoder = decoder
+        self.num_frozen = num_frozen_decoder_modules
+
+    def forward(self, codes):
+        if codes.shape[1] != self.decoder.config.num_quantizers:
+            raise ValueError(
+                f"Expected {self.decoder.config.num_quantizers} layers of codes, "
+                f"got {codes.shape[1]}"
+            )
+
+        # Frozen part: no_grad for VRAM savings
+        with torch.no_grad():
+            hidden = self.decoder.quantizer.decode(codes)
+            hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
+            hidden = self.decoder.pre_transformer(
+                inputs_embeds=hidden
+            ).last_hidden_state
+            hidden = hidden.permute(0, 2, 1)
+            for blocks in self.decoder.upsample:
+                for block in blocks:
+                    hidden = block(hidden)
+            wav = hidden
+            for block in self.decoder.decoder[: self.num_frozen]:
+                wav = block(wav)
+        wav = wav.detach()
+
+        # Trainable part: gradients enabled
+        for block in self.decoder.decoder[self.num_frozen :]:
+            wav = block(wav)
+
+        return wav.clamp(min=-1, max=1)
+
+
+def create_model(args, accelerator):
+    """Create 48kHz decoder model with frozen base weights."""
+    accelerator.print(f"Loading base decoder from {args.decoder_model_path}...")
+
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        args.decoder_model_path,
+        attn_implementation="eager",
+        dtype=torch.bfloat16,
+        device_map="cpu",
+    )
+    base_decoder = tokenizer.model.decoder
+    base_state_dict = base_decoder.state_dict()
+    base_num_decoder_modules = len(base_decoder.decoder)
+
+    accelerator.print(
+        f"Base decoder: upsample_rates={list(base_decoder.config.upsample_rates)}, "
+        f"decoder modules={base_num_decoder_modules}"
+    )
+
+    # Create 48kHz config
+    config_dict = base_decoder.config.to_dict()
+    base_upsample_rates = list(config_dict["upsample_rates"])
+    new_upsample_rates = base_upsample_rates + [args.extra_upsample_rate]
+    config_dict["upsample_rates"] = new_upsample_rates
+    for key in ("model_type", "transformers_version"):
+        config_dict.pop(key, None)
+
+    decoder_config = Qwen3TTSTokenizerV2DecoderConfig(**config_dict)
+    if accelerator.device.type == "cuda":
+        decoder_config._attn_implementation = "flash_attention_2"
+
+    accelerator.print(f"New upsample_rates: {new_upsample_rates}")
+
+    decoder = Qwen3TTSTokenizerV2Decoder(decoder_config).to(torch.bfloat16)
+    missing_keys, unexpected_keys = decoder.load_state_dict(
+        base_state_dict, strict=False
+    )
+    accelerator.print(
+        f"Weight loading: {len(missing_keys)} missing keys (new blocks), "
+        f"{len(unexpected_keys)} unexpected keys (old final layers)"
+    )
+
+    del tokenizer, base_decoder, base_state_dict
+    gc.collect()
+
+    # Freeze base parameters
+    if args.num_frozen is not None:
+        num_frozen = args.num_frozen
+        if num_frozen < 0 or num_frozen > len(decoder.decoder):
+            raise ValueError(
+                f"--num_frozen must be in [0, {len(decoder.decoder)}], got {num_frozen}"
+            )
+    else:
+        num_frozen = base_num_decoder_modules - 2
+    for param in decoder.parameters():
+        param.requires_grad = False
+    for i in range(num_frozen, len(decoder.decoder)):
+        for param in decoder.decoder[i].parameters():
+            param.requires_grad = True
+
+    trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in decoder.parameters())
+    accelerator.print(
+        f"Generator trainable: {trainable_params:,} / {total_params:,} "
+        f"({trainable_params / total_params * 100:.4f}%)"
+    )
+
+    wrapper = DecoderTrainingWrapper(decoder, num_frozen)
+
+    # Load pre-trained generator weights if provided
+    if args.resume_generator_from:
+        checkpoint_path = Path(args.resume_generator_from) / "decoder_block.safetensors"
+        if checkpoint_path.exists():
+            accelerator.print(f"Loading generator weights from {checkpoint_path}...")
+            trained_weights = load_file(str(checkpoint_path))
+            missing, unexpected = decoder.load_state_dict(trained_weights, strict=False)
+            accelerator.print(
+                f"Generator warm-start: {len(missing)} missing (frozen layers), "
+                f"{len(unexpected)} unexpected"
+            )
+        else:
+            accelerator.print(
+                f"WARNING: Generator checkpoint not found at {checkpoint_path}"
+            )
+
+    return wrapper, num_frozen, base_upsample_rates, new_upsample_rates
+
+
+def create_discriminators(accelerator):
+    """Create MPD and SpecDiscriminator discriminators."""
+    mpd = HiFiGANMultiPeriodDiscriminator()
+    msd = SpecDiscriminator()  # STFT-based, 8-scale, 48kHz optimized
+
+    mpd_params = sum(p.numel() for p in mpd.parameters())
+    msd_params = sum(p.numel() for p in msd.parameters())
+    accelerator.print(
+        f"Discriminator params: MPD={mpd_params:,}, SpecDisc={msd_params:,}, "
+        f"Total={mpd_params + msd_params:,}"
+    )
+
+    return mpd, msd
+
+
+@torch.no_grad()
+def eval_step(
+    model: nn.Module,
+    mel_loss_fn: MultiResolutionMelSpectrogramLoss,
+    dataloader: DataLoader,
+    accelerator: Accelerator,
+    max_batches: int = 50,
+) -> dict:
+    """Evaluation (mel loss only)."""
+    model.eval()
+
+    total_mel_loss = 0.0
+    num_batches = 0
+
+    for batch in dataloader:
+        if num_batches >= max_batches:
+            break
+
+        audio_codes = batch["audio_codes"].to(accelerator.device).transpose(1, 2)
+        target_48k = batch["audio_48k"].to(accelerator.device)
+        lengths_48k = batch["audio_48k_lengths"].to(accelerator.device)
+
+        pred_48k = model(audio_codes)
+
+        # Align shapes
+        pred = pred_48k.squeeze(1) if pred_48k.dim() == 3 else pred_48k
+        target = target_48k.squeeze(1) if target_48k.dim() == 3 else target_48k
+        min_len = min(pred.shape[-1], target.shape[-1])
+        pred = pred[..., :min_len]
+        target = target[..., :min_len]
+
+        # Mask padding region
+        mask = torch.arange(min_len, device=pred.device)[None, :] < lengths_48k[:, None]
+        pred = pred * mask
+        target = target * mask
+
+        mel_loss = mel_loss_fn(pred, target)
+        total_mel_loss += mel_loss.item()
+        num_batches += 1
+
+    model.train()
+    return {"val_mel_loss": total_mel_loss / max(num_batches, 1)}
+
+
+def save_checkpoint(
+    model: nn.Module,
+    mpd: nn.Module,
+    msd: nn.Module,
+    optimizer_g: torch.optim.Optimizer,
+    optimizer_d: torch.optim.Optimizer,
+    scheduler_g,
+    scheduler_d,
+    step: int,
+    epoch: int,
+    args,
+    accelerator: Accelerator,
+    num_frozen: int,
+    base_upsample_rates: list,
+    new_upsample_rates: list,
+    is_best: bool = False,
+):
+    """Save checkpoint (generator weights + discriminator + training state)."""
+    if not accelerator.is_main_process:
+        return
+
+    output_dir = Path(args.output_dir)
+    checkpoint_name = "checkpoint-best" if is_best else f"checkpoint-step-{step}"
+    checkpoint_dir = output_dir / checkpoint_name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generator trainable weights (merge.py compatible)
+    unwrapped_model = accelerator.unwrap_model(model)
+    decoder = unwrapped_model.decoder
+    trainable_state_dict = {}
+    for i in range(num_frozen, len(decoder.decoder)):
+        prefix = f"decoder.{i}."
+        for k, v in decoder.state_dict().items():
+            if k.startswith(prefix):
+                trainable_state_dict[k] = v.cpu()
+    save_file(trainable_state_dict, str(checkpoint_dir / "decoder_block.safetensors"))
+
+    # Discriminator weights
+    unwrapped_mpd = accelerator.unwrap_model(mpd)
+    unwrapped_msd = accelerator.unwrap_model(msd)
+    torch.save(
+        {
+            "mpd": unwrapped_mpd.state_dict(),
+            "msd": unwrapped_msd.state_dict(),
+        },
+        checkpoint_dir / "discriminator.pt",
+    )
+
+    # Training state
+    torch.save(
+        {
+            "optimizer_g": optimizer_g.state_dict(),
+            "optimizer_d": optimizer_d.state_dict(),
+            "scheduler_g": scheduler_g.state_dict() if scheduler_g else None,
+            "scheduler_d": scheduler_d.state_dict() if scheduler_d else None,
+            "step": step,
+            "epoch": epoch,
+        },
+        checkpoint_dir / "training_state.pt",
+    )
+
+    # Config
+    config_dict = {
+        "base_upsample_rates": base_upsample_rates,
+        "new_upsample_rates": new_upsample_rates,
+        "extra_upsample_rate": args.extra_upsample_rate,
+        "num_frozen_decoder_modules": num_frozen,
+        "step": step,
+        "epoch": epoch,
+        "training_type": "gan",
+        "lambda_adv": args.lambda_adv,
+        "lambda_fm": args.lambda_fm,
+        "lambda_d_mpd": args.lambda_d_mpd,
+        "lambda_d_msd": args.lambda_d_msd,
+        "gan_crop_seconds": args.gan_crop_seconds,
+        "lambda_multi_res_mel": args.lambda_multi_res_mel,
+        "lambda_global_rms": args.lambda_global_rms,
+    }
+    with open(checkpoint_dir / "config.json", "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    accelerator.print(f"Saved checkpoint to {checkpoint_dir}")
+
+
+def main():
+    args = parse_args()
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.log_with,
+        project_dir=args.output_dir,
+    )
+
+    set_seed(args.seed)
+
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    # Create generator
+    model, num_frozen, base_upsample_rates, new_upsample_rates = create_model(
+        args, accelerator
+    )
+
+    # Create discriminators
+    mpd, msd = create_discriminators(accelerator)
+
+    # Mel loss (reconstruction component)
+    target_sample_rate = 24000 * args.extra_upsample_rate
+    gan_crop_samples = (
+        int(args.gan_crop_seconds * target_sample_rate)
+        if args.gan_crop_seconds > 0
+        else 0
+    )
+    multi_res_mel_loss_fn = MultiResolutionMelSpectrogramLoss(
+        sample_rate=target_sample_rate
+    ).to(accelerator.device)
+
+    # Training data
+    accelerator.print(f"Loading training data: {args.train_shards}...")
+    path = args.train_shards
+    if "*" in path and "{" not in path:
+        expanded_files = sorted(glob.glob(path))
+        if not expanded_files:
+            print(f"Error: No files found matching pattern: {path}")
+            sys.exit(1)
+        print(f"Found {len(expanded_files)} tar files")
+        shard_pattern = expanded_files
+    else:
+        shard_pattern = path
+
+    train_dataloader = create_webdataset_loader(
+        shard_pattern=shard_pattern,
+        target_sample_rate=target_sample_rate,
+        max_audio_length=args.max_audio_length,
+        min_audio_length=args.min_audio_length,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle_buffer=1000,
+    )
+
+    # Validation data (optional)
+    val_dataloader = None
+    if args.val_shards:
+        path = args.val_shards
+        if "*" in path and "{" not in path:
+            expanded_files = sorted(glob.glob(path))
+            if not expanded_files:
+                print(f"Error: No files found matching pattern: {path}")
+                sys.exit(1)
+            print(f"Found {len(expanded_files)} tar files")
+            shard_pattern = expanded_files
+        else:
+            shard_pattern = path
+
+        val_dataloader = create_webdataset_loader(
+            shard_pattern=shard_pattern,
+            target_sample_rate=target_sample_rate,
+            max_audio_length=args.max_audio_length,
+            min_audio_length=args.min_audio_length,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle_buffer=0,
+        )
+
+    # Separate optimizers for G and D
+    optimizer_g = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr_g,
+        betas=(0.8, 0.99),
+        weight_decay=args.weight_decay,
+    )
+    optimizer_d = AdamW(
+        list(mpd.parameters()) + list(msd.parameters()),
+        lr=args.lr_d,
+        betas=(0.8, 0.99),
+        weight_decay=args.weight_decay,
+    )
+
+    # Schedulers
+    if args.max_train_steps:
+        total_steps = args.max_train_steps
+    else:
+        try:
+            total_steps = (
+                len(train_dataloader)
+                * args.num_epochs
+                // args.gradient_accumulation_steps
+            )
+        except TypeError:
+            accelerator.print(
+                "WARNING: Cannot determine dataset length. "
+                "Please specify --max_train_steps."
+            )
+            total_steps = 500000
+
+    scheduler_g = CosineAnnealingLR(
+        optimizer_g, T_max=total_steps, eta_min=args.lr_g * 0.1
+    )
+    scheduler_d = CosineAnnealingLR(
+        optimizer_d, T_max=total_steps, eta_min=args.lr_d * 0.1
+    )
+    accelerator.print(f"Total training steps: {total_steps}")
+
+    # Prepare with Accelerate
+    model, optimizer_g, train_dataloader, scheduler_g = accelerator.prepare(
+        model, optimizer_g, train_dataloader, scheduler_g
+    )
+    mpd, optimizer_d, scheduler_d = accelerator.prepare(mpd, optimizer_d, scheduler_d)
+    msd = accelerator.prepare(msd)
+    if val_dataloader:
+        val_dataloader = accelerator.prepare(val_dataloader)
+
+    # Initialize tracker
+    if args.log_with and accelerator.is_main_process:
+        tracker_config = {
+            "batch_size": args.batch_size,
+            "lr_g": args.lr_g,
+            "lr_d": args.lr_d,
+            "lambda_adv": args.lambda_adv,
+            "lambda_fm": args.lambda_fm,
+            "lambda_d_mpd": args.lambda_d_mpd,
+            "lambda_d_msd": args.lambda_d_msd,
+            "gan_crop_seconds": args.gan_crop_seconds,
+            "lambda_multi_res_mel": args.lambda_multi_res_mel,
+            "lambda_global_rms": args.lambda_global_rms,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "extra_upsample_rate": args.extra_upsample_rate,
+            "max_audio_length": args.max_audio_length,
+            "training_type": "gan",
+        }
+        if args.log_with == "wandb":
+            accelerator.init_trackers(
+                project_name=args.wandb_project,
+                config=tracker_config,
+                init_kwargs={
+                    "wandb": {
+                        "name": args.wandb_run_name,
+                        "entity": args.wandb_entity,
+                        "dir": args.output_dir,
+                    }
+                },
+            )
+        else:
+            accelerator.init_trackers(
+                project_name=args.wandb_project, config=tracker_config
+            )
+    elif args.log_with:
+        accelerator.init_trackers(project_name=args.wandb_project)
+
+    # Resume from full GAN checkpoint
+    start_step = 0
+    start_epoch = 0
+    if args.resume_from:
+        accelerator.print(f"Resuming GAN training from {args.resume_from}...")
+        checkpoint_dir = Path(args.resume_from)
+
+        # Load checkpoint config to check num_frozen compatibility
+        prev_num_frozen = None
+        config_path = checkpoint_dir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                ckpt_config = json.load(f)
+            prev_num_frozen = ckpt_config.get("num_frozen_decoder_modules")
+
+        num_frozen_changed = (
+            prev_num_frozen is not None and prev_num_frozen != num_frozen
+        )
+        if num_frozen_changed:
+            accelerator.print(
+                f"NOTE: num_frozen changed ({prev_num_frozen} -> {num_frozen}). "
+                f"Generator optimizer/scheduler state will NOT be restored."
+            )
+
+        # Load discriminator weights
+        disc_state = torch.load(checkpoint_dir / "discriminator.pt", map_location="cpu")
+        accelerator.unwrap_model(mpd).load_state_dict(disc_state["mpd"])
+        accelerator.unwrap_model(msd).load_state_dict(disc_state["msd"])
+
+        # Load training state
+        training_state = torch.load(
+            checkpoint_dir / "training_state.pt", map_location="cpu"
+        )
+        start_step = training_state["step"]
+        start_epoch = training_state["epoch"]
+
+        if not num_frozen_changed:
+            optimizer_g.load_state_dict(training_state["optimizer_g"])
+            if training_state["scheduler_g"] and scheduler_g:
+                scheduler_g.load_state_dict(training_state["scheduler_g"])
+
+        # Discriminator optimizer/scheduler is always restored (unaffected by num_frozen)
+        optimizer_d.load_state_dict(training_state["optimizer_d"])
+        if training_state["scheduler_d"] and scheduler_d:
+            scheduler_d.load_state_dict(training_state["scheduler_d"])
+
+        accelerator.print(f"Resumed from step {start_step}, epoch {start_epoch}")
+
+    # Training loop
+    global_step = start_step
+    best_val_loss = float("inf")
+
+    model.train()
+    mpd.train()
+    msd.train()
+
+    # Persistent across optimizer-step logs.
+    mpd_grad_norm = 0.0
+    msd_grad_norm = 0.0
+    total_seq_len_accumulated = 0
+    gan_crop_len_samples = 0
+    padding_ratio = 0.0
+
+    for epoch in range(start_epoch, args.num_epochs):
+        accelerator.print(f"\n{'=' * 50}")
+        accelerator.print(f"Epoch {epoch + 1}/{args.num_epochs}")
+        accelerator.print(f"{'=' * 50}")
+
+        progress_bar = tqdm(
+            train_dataloader,
+            desc=f"Epoch {epoch + 1}",
+            disable=not accelerator.is_local_main_process,
+        )
+
+        for step, batch in enumerate(progress_bar):
+            audio_codes = batch["audio_codes"].to(accelerator.device).transpose(1, 2)
+            target_48k = batch["audio_48k"].to(accelerator.device)
+            lengths_48k = batch["audio_48k_lengths"].to(accelerator.device)
+
+            # Generator forward
+            pred_48k = model(audio_codes)
+
+            # Align shapes for loss computation
+            pred = pred_48k.squeeze(1) if pred_48k.dim() == 3 else pred_48k
+            target = target_48k.squeeze(1) if target_48k.dim() == 3 else target_48k
+            min_len = min(pred.shape[-1], target.shape[-1])
+            pred = pred[..., :min_len]
+            target = target[..., :min_len]
+
+            pred_gan, target_gan, gan_crop_len_samples, padding_ratio = build_gan_crops(
+                pred=pred,
+                target=target,
+                lengths_48k=lengths_48k,
+                max_len=min_len,
+                crop_samples=gan_crop_samples,
+            )
+
+            # Mask padding region
+            mask = (
+                torch.arange(min_len, device=pred.device)[None, :]
+                < lengths_48k[:, None]
+            )
+            pred = pred * mask
+            target = target * mask
+
+            # Reshape to (B, 1, T) for discriminators (padding excluded by random crop)
+            pred_wav = pred_gan.unsqueeze(1)
+            target_wav = target_gan.unsqueeze(1)
+
+            # Align dtype with discriminator params (handles generator checkpoint
+            # loaded in bf16 when mixed_precision=no)
+            _disc_dtype = next(mpd.parameters()).dtype
+            pred_wav = pred_wav.to(dtype=_disc_dtype)
+            target_wav = target_wav.to(dtype=_disc_dtype)
+
+            # Update D and G under a single accumulation context so
+            # `accelerator.sync_gradients` is aligned for both.
+            with accelerator.accumulate(model, mpd, msd):
+                # =====================
+                # Discriminator update
+                # =====================
+                # MPD
+                mpd_real_outputs = mpd(target_wav)
+                mpd_fake_outputs = mpd(pred_wav.detach())
+                loss_d_mpd = discriminator_loss(mpd_real_outputs, mpd_fake_outputs)
+
+                # MSD
+                msd_real_outputs = msd(target_wav)
+                msd_fake_outputs = msd(pred_wav.detach())
+                loss_d_msd = discriminator_loss(msd_real_outputs, msd_fake_outputs)
+
+                loss_d = args.lambda_d_mpd * loss_d_mpd + args.lambda_d_msd * loss_d_msd
+
+                optimizer_d.zero_grad()
+                accelerator.backward(loss_d)
+                # Capture per-model gradient norms immediately before D step.
+                if accelerator.sync_gradients:
+                    mpd_grad_norm = (
+                        sum(
+                            p.grad.norm().item() ** 2
+                            for p in mpd.parameters()
+                            if p.grad is not None
+                        )
+                        ** 0.5
+                    )
+                    msd_grad_norm = (
+                        sum(
+                            p.grad.norm().item() ** 2
+                            for p in msd.parameters()
+                            if p.grad is not None
+                        )
+                        ** 0.5
+                    )
+                accelerator.clip_grad_norm_(
+                    list(mpd.parameters()) + list(msd.parameters()),
+                    args.max_grad_norm,
+                )
+                optimizer_d.step()
+                scheduler_d.step()
+
+                # =====================
+                # Generator update
+                # =====================
+                # MPD (real outputs computed without grad for FM loss)
+                mpd_fake_outputs_g = mpd(pred_wav)
+                with torch.no_grad():
+                    mpd_real_outputs_g = mpd(target_wav)
+                loss_g_adv_mpd = generator_adversarial_loss(mpd_fake_outputs_g)
+                loss_fm_mpd = feature_matching_loss(
+                    mpd_real_outputs_g, mpd_fake_outputs_g
+                )
+
+                # MSD (real outputs computed without grad for FM loss)
+                msd_fake_outputs_g = msd(pred_wav)
+                with torch.no_grad():
+                    msd_real_outputs_g = msd(target_wav)
+                loss_g_adv_msd = generator_adversarial_loss(msd_fake_outputs_g)
+                loss_fm_msd = feature_matching_loss(
+                    msd_real_outputs_g, msd_fake_outputs_g
+                )
+
+                # Combined adversarial + feature matching
+                loss_g_adv = loss_g_adv_mpd + loss_g_adv_msd
+                loss_fm = loss_fm_mpd + loss_fm_msd
+
+                # Multi-resolution mel loss (inworld-ai style, 7 scales)
+                if args.lambda_multi_res_mel > 0:
+                    loss_multi_res_mel = multi_res_mel_loss_fn(pred, target)
+                else:
+                    loss_multi_res_mel = torch.tensor(0.0, device=pred.device)
+
+                # Global dB RMS loss (inworld-ai style)
+                if args.lambda_global_rms > 0:
+                    loss_global_rms = global_rms_loss(pred, target)
+                else:
+                    loss_global_rms = torch.tensor(0.0, device=pred.device)
+
+                # Total generator loss
+                loss_g = (
+                    args.lambda_adv * loss_g_adv
+                    + args.lambda_fm * loss_fm
+                    + args.lambda_multi_res_mel * loss_multi_res_mel
+                    + args.lambda_global_rms * loss_global_rms
+                )
+
+                optimizer_g.zero_grad()
+                accelerator.backward(loss_g)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer_g.step()
+                scheduler_g.step()
+
+            # Count/log/eval/save only on real optimizer sync steps.
+            if accelerator.sync_gradients:
+                global_step += 1
+                total_sec = lengths_48k.sum().item() / target_sample_rate
+                token_per_sec = 12.5
+                total_seq_len = int(total_sec * token_per_sec)
+                total_seq_len_accumulated += total_seq_len
+
+                # Logging
+                if global_step % args.log_every == 0:
+                    log_dict = {
+                        "d/loss_total": loss_d.item(),
+                        "d/loss_mpd": loss_d_mpd.item(),
+                        "d/loss_msd": loss_d_msd.item(),
+                        # "d/r_loss_mpd": loss_d_mpd_r.item(),
+                        # "d/g_loss_mpd": loss_d_mpd_g.item(),
+                        # "d/r_loss_msd": loss_d_msd_r.item(),
+                        # "d/g_loss_msd": loss_d_msd_g.item(),
+                        # "d/dr_mpd": dr_mpd.item(),
+                        # "d/dg_mpd": dg_mpd.item(),
+                        # "d/dr_msd": dr_msd.item(),
+                        # "d/dg_msd": dg_msd.item(),
+                        "d/grad_norm_mpd": mpd_grad_norm,
+                        "d/grad_norm_msd": msd_grad_norm,
+                        "g/loss_total": loss_g.item(),
+                        "g/loss_adv": loss_g_adv.item(),
+                        "g/loss_fm": loss_fm.item(),
+                        "g/loss_multi_res_mel": loss_multi_res_mel.item(),
+                        "g/loss_global_rms": loss_global_rms.item(),
+                        "lr/generator": scheduler_g.get_last_lr()[0],
+                        "lr/discriminator": scheduler_d.get_last_lr()[0],
+                        "seq_len": total_seq_len,
+                        "total_seq_len_accumulated": total_seq_len_accumulated,
+                        "gan/crop_len_samples": gan_crop_len_samples,
+                        "gan/crop_len_seconds": gan_crop_len_samples
+                        / target_sample_rate,
+                        "gan/padding_ratio": padding_ratio,
+                    }
+                    accelerator.log(log_dict, step=global_step)
+
+                    progress_bar.set_postfix(
+                        d=loss_d.item(),
+                        g=loss_g.item(),
+                        adv=loss_g_adv.item(),
+                        mel=loss_multi_res_mel.item(),
+                    )
+
+                # Evaluation
+                if (
+                    val_dataloader
+                    and global_step % args.eval_every == 0
+                    and global_step > 0
+                ):
+                    val_losses = eval_step(
+                        model, multi_res_mel_loss_fn, val_dataloader, accelerator
+                    )
+                    accelerator.print(
+                        f"\nStep {global_step} - Validation: {val_losses}"
+                    )
+                    accelerator.log(val_losses, step=global_step)
+
+                    if val_losses["val_mel_loss"] < best_val_loss:
+                        best_val_loss = val_losses["val_mel_loss"]
+                        save_checkpoint(
+                            model,
+                            mpd,
+                            msd,
+                            optimizer_g,
+                            optimizer_d,
+                            scheduler_g,
+                            scheduler_d,
+                            global_step,
+                            epoch,
+                            args,
+                            accelerator,
+                            num_frozen,
+                            base_upsample_rates,
+                            new_upsample_rates,
+                            is_best=True,
+                        )
+
+                # Save checkpoint
+                if global_step % args.save_every == 0 and global_step > 0:
+                    save_checkpoint(
+                        model,
+                        mpd,
+                        msd,
+                        optimizer_g,
+                        optimizer_d,
+                        scheduler_g,
+                        scheduler_d,
+                        global_step,
+                        epoch,
+                        args,
+                        accelerator,
+                        num_frozen,
+                        base_upsample_rates,
+                        new_upsample_rates,
+                    )
+
+                if args.max_train_steps and global_step >= args.max_train_steps:
+                    break
+
+        # Save at end of epoch
+        save_checkpoint(
+            model,
+            mpd,
+            msd,
+            optimizer_g,
+            optimizer_d,
+            scheduler_g,
+            scheduler_d,
+            global_step,
+            epoch,
+            args,
+            accelerator,
+            num_frozen,
+            base_upsample_rates,
+            new_upsample_rates,
+        )
+
+        if args.max_train_steps and global_step >= args.max_train_steps:
+            break
+
+    # Final checkpoint
+    save_checkpoint(
+        model,
+        mpd,
+        msd,
+        optimizer_g,
+        optimizer_d,
+        scheduler_g,
+        scheduler_d,
+        global_step,
+        args.num_epochs,
+        args,
+        accelerator,
+        num_frozen,
+        base_upsample_rates,
+        new_upsample_rates,
+    )
+
+    accelerator.end_training()
+    accelerator.print("\nGAN training completed!")
+
+
+if __name__ == "__main__":
+    main()
