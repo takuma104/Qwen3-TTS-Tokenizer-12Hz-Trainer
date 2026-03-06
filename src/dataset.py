@@ -1,9 +1,12 @@
+# coding=utf-8
+# SPDX-License-Identifier: Apache-2.0
+
 """
-Dataset for 48kHz Upsampler Training
+Dataset for Qwen3TTSTokenizerV2Decoder Training
 
 Data format:
 - audio_codes: Encoded audio codes (12Hz, 16 quantizers)
-- audio: Original audio file path (48kHz or to be resampled)
+- audio: Original audio file (resampled to target_sample_rate)
 """
 
 from typing import List
@@ -21,30 +24,30 @@ def collate_fn(batch: List[dict]) -> dict:
     """
     # Get maximum lengths
     max_codes = max(b["audio_codes"].shape[0] for b in batch)
-    max_samples_48k = max(b["audio_48k"].shape[0] for b in batch)
+    max_samples = max(b["audio"].shape[0] for b in batch)
 
     batch_size = len(batch)
 
     # Initialize batch tensors
     audio_codes = torch.zeros(batch_size, max_codes, 16, dtype=torch.long)
-    audio_48k = torch.zeros(batch_size, max_samples_48k)
+    audio = torch.zeros(batch_size, max_samples)
     code_lengths = torch.zeros(batch_size, dtype=torch.long)
-    audio_48k_lengths = torch.zeros(batch_size, dtype=torch.long)
+    audio_lengths = torch.zeros(batch_size, dtype=torch.long)
 
     for i, b in enumerate(batch):
         codes_len = b["audio_codes"].shape[0]
-        samples_48k = b["audio_48k"].shape[0]
+        num_samples = b["audio"].shape[0]
 
         audio_codes[i, :codes_len] = b["audio_codes"]
-        audio_48k[i, :samples_48k] = b["audio_48k"]
+        audio[i, :num_samples] = b["audio"]
         code_lengths[i] = codes_len
-        audio_48k_lengths[i] = samples_48k
+        audio_lengths[i] = num_samples
 
     return {
         "audio_codes": audio_codes,  # (batch, max_codes, 16)
-        "audio_48k": audio_48k,  # (batch, max_samples_48k)
+        "audio": audio,  # (batch, max_samples)
         "code_lengths": code_lengths,  # (batch,)
-        "audio_48k_lengths": audio_48k_lengths,  # (batch,)
+        "audio_lengths": audio_lengths,  # (batch,)
     }
 
 
@@ -124,26 +127,26 @@ def create_webdataset_loader(
             end_sample = int(end_code * samples_per_code)
             audio = audio[start_sample:end_sample]
 
-        # Resample to target (48kHz)
+        # Resample to target sample rate
         if sr != target_sample_rate:
-            audio_48k = librosa.resample(
+            audio_resampled = librosa.resample(
                 audio, orig_sr=sr, target_sr=target_sample_rate
             )
         else:
-            audio_48k = audio
+            audio_resampled = audio
 
         # Convert to tensor
-        audio_48k = torch.from_numpy(audio_48k).float()
+        audio_resampled = torch.from_numpy(audio_resampled).float()
 
         # Skip very quiet audio
-        rms = torch.sqrt(torch.mean(audio_48k**2, dim=-1) + 1e-8)
+        rms = torch.sqrt(torch.mean(audio_resampled**2, dim=-1) + 1e-8)
         rms_db = (20 * torch.log10(rms)).item()
         if rms_db < -40.0:
             return None
 
         return {
             "audio_codes": audio_codes,  # (seq_len, 16)
-            "audio_48k": audio_48k,  # (samples_48k,)
+            "audio": audio_resampled,  # (num_samples,)
         }
 
     # Build WebDataset
@@ -195,6 +198,6 @@ if __name__ == "__main__":
     for i, batch in enumerate(loader):
         print(f"Batch {i}:")
         print(f"  audio_codes: {batch['audio_codes'].shape}")
-        print(f"  audio_48k: {batch['audio_48k'].shape}")
+        print(f"  audio: {batch['audio'].shape}")
         if i >= 2:
             break

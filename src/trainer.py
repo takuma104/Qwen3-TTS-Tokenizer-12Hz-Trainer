@@ -1,5 +1,4 @@
 # coding=utf-8
-# Copyright 2026 The Alibaba Qwen team & Takuma Mori.
 # SPDX-License-Identifier: Apache-2.0
 """
 Qwen3TTSTokenizerV2Decoder Fine-tuning Script
@@ -98,11 +97,11 @@ def expand_shards(path: str, print_fn=print) -> "str | list[str]":
 
 
 def align_audio(
-    pred_48k: torch.Tensor, target_48k: torch.Tensor
+    pred_audio: torch.Tensor, target_audio: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Squeeze channel dim if present and truncate both tensors to the same length."""
-    pred = pred_48k.squeeze(1) if pred_48k.dim() == 3 else pred_48k
-    target = target_48k.squeeze(1) if target_48k.dim() == 3 else target_48k
+    pred = pred_audio.squeeze(1) if pred_audio.dim() == 3 else pred_audio
+    target = target_audio.squeeze(1) if target_audio.dim() == 3 else target_audio
     min_len = min(pred.shape[-1], target.shape[-1])
     return pred[..., :min_len], target[..., :min_len], min_len
 
@@ -314,12 +313,12 @@ def parse_args():
 def build_gan_crops(
     pred: torch.Tensor,
     target: torch.Tensor,
-    lengths_48k: torch.Tensor,
+    audio_lengths: torch.Tensor,
     max_len: int,
     crop_samples: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int, float]:
     """Build fixed-length random crops for GAN losses, excluding padded regions."""
-    lengths = torch.clamp(lengths_48k, min=1, max=max_len).to(dtype=torch.long)
+    lengths = torch.clamp(audio_lengths, min=1, max=max_len).to(dtype=torch.long)
     min_valid_len = int(lengths.min().item())
     if crop_samples > 0:
         crop_len = min(crop_samples, min_valid_len)
@@ -552,14 +551,14 @@ def eval_step(
             break
 
         audio_codes = batch["audio_codes"].to(accelerator.device).transpose(1, 2)
-        target_48k = batch["audio_48k"].to(accelerator.device)
-        lengths_48k = batch["audio_48k_lengths"].to(accelerator.device)
+        target_audio = batch["audio"].to(accelerator.device)
+        audio_lengths = batch["audio_lengths"].to(accelerator.device)
 
         pred_48k = model(audio_codes)
 
         # Align shapes and mask padding
-        pred, target, min_len = align_audio(pred_48k, target_48k)
-        pred, target = apply_length_mask(pred, target, lengths_48k, min_len)
+        pred, target, min_len = align_audio(pred_48k, target_audio)
+        pred, target = apply_length_mask(pred, target, audio_lengths, min_len)
 
         mel_loss = mel_loss_fn(pred, target)
         total_mel_loss += mel_loss.item()
@@ -923,17 +922,17 @@ def main():
 
         for step, batch in enumerate(progress_bar):
             audio_codes = batch["audio_codes"].to(accelerator.device).transpose(1, 2)
-            target_48k = batch["audio_48k"].to(accelerator.device)
-            lengths_48k = batch["audio_48k_lengths"].to(accelerator.device)
+            target_audio = batch["audio"].to(accelerator.device)
+            audio_lengths = batch["audio_lengths"].to(accelerator.device)
 
             # Generator forward
             pred_48k = model(audio_codes)
 
             # Align shapes for loss computation
-            pred, target, min_len = align_audio(pred_48k, target_48k)
+            pred, target, min_len = align_audio(pred_48k, target_audio)
 
             # Mask padding region
-            pred, target = apply_length_mask(pred, target, lengths_48k, min_len)
+            pred, target = apply_length_mask(pred, target, audio_lengths, min_len)
 
             # Initialize GAN loss placeholders
             loss_d = pred.new_zeros(())
@@ -951,7 +950,7 @@ def main():
                     build_gan_crops(
                         pred=pred,
                         target=target,
-                        lengths_48k=lengths_48k,
+                        audio_lengths=audio_lengths,
                         max_len=min_len,
                         crop_samples=gan_crop_samples,
                     )
@@ -1058,7 +1057,7 @@ def main():
             # Count/log/eval/save only on real optimizer sync steps.
             if accelerator.sync_gradients:
                 global_step += 1
-                total_sec = lengths_48k.sum().item() / target_sample_rate
+                total_sec = audio_lengths.sum().item() / target_sample_rate
                 token_per_sec = 12.5
                 total_seq_len = int(total_sec * token_per_sec)
                 total_seq_len_accumulated += total_seq_len
