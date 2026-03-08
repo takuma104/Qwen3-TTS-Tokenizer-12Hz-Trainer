@@ -197,6 +197,13 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--no_resume_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Do not resume optimizer state when resuming from a checkpoint.",
+    )
+
     # Training settings
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument(
@@ -927,20 +934,21 @@ def main():
         start_step = training_state["step"]
         start_epoch = training_state["epoch"]
 
-        if not num_frozen_changed:
-            optimizer_g.load_state_dict(training_state["optimizer_g"])
-            if training_state["scheduler_g"] and scheduler_g:
-                scheduler_g.load_state_dict(training_state["scheduler_g"])
+        if not args.no_resume_optimizer:
+            if not num_frozen_changed:
+                optimizer_g.load_state_dict(training_state["optimizer_g"])
+                if training_state["scheduler_g"] and scheduler_g:
+                    scheduler_g.load_state_dict(training_state["scheduler_g"])
 
-        # Discriminator optimizer/scheduler is always restored (unaffected by num_frozen)
-        if (
-            args.use_gan
-            and optimizer_d is not None
-            and training_state.get("optimizer_d")
-        ):
-            optimizer_d.load_state_dict(training_state["optimizer_d"])
-        if args.use_gan and training_state.get("scheduler_d") and scheduler_d:
-            scheduler_d.load_state_dict(training_state["scheduler_d"])
+            # Discriminator optimizer/scheduler is always restored (unaffected by num_frozen)
+            if (
+                args.use_gan
+                and optimizer_d is not None
+                and training_state.get("optimizer_d")
+            ):
+                optimizer_d.load_state_dict(training_state["optimizer_d"])
+            if args.use_gan and training_state.get("scheduler_d") and scheduler_d:
+                scheduler_d.load_state_dict(training_state["scheduler_d"])
 
         accelerator.print(f"Resumed from step {start_step}, epoch {start_epoch}")
 
