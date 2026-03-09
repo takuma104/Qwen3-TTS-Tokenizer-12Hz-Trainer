@@ -29,6 +29,7 @@ dependencies = [
   "loguru>=0.7.3",
   "resampy>=0.4.3",
   "torchcodec>=0.10.0",
+  "pyloudnorm>=0.2.0",
 ]
 
 # third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
