@@ -1,5 +1,7 @@
 # Qwen3-TTS-Tokenizer-12Hz Trainer
 
+[🤗 Model Weight / Audio Sample on Hugging Face](https://huggingface.co/takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz)
+
 A GAN-based fine-tuning framework for [Qwen/Qwen3-TTS-Tokenizer-12Hz](https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz) decoder. The primary use case is extending the decoder with an extra upsample block to produce **48 kHz** output — but the same script can also be used to fine-tune the base 24 kHz decoder on custom speech data.
 
 For a concrete example of what this trainer produces, see the model card for [takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz](https://huggingface.co/takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz), which was trained with this codebase.
@@ -14,6 +16,11 @@ For a concrete example of what this trainer produces, see the model card for [ta
 - **`accelerate` + bf16 mixed precision** — multi-GPU ready via HuggingFace Accelerate
 - **W&B logging** — training/validation metrics and audio samples logged to Weights & Biases
 - **Checkpoint resume** — resume from any saved checkpoint with `--resume_from`
+
+## How It Works 
+
+In the HuggingFace ecosystem, model weights are always distributed with a `config.json` that defines the architecture; `transformers` dynamically instantiates the model graph from these parameters before loading the weights — and Qwen3-TTS fully adheres to this convention. Its 12 Hz codec decoder performs 1920× upsampling (12.5 Hz × 1920 = 24 kHz) governed by the `upsample_rates` list in `config.json`. This 48 kHz variant achieves double the output sample rate purely by appending `2` to that list (`[8, 5, 4, 3] → [8, 5, 4, 3, 2]`), letting `transformers` instantiate one additional `DecoderBlock` at load time — no code changes required.
+
 
 ## Repository Structure
 
