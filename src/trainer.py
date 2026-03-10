@@ -244,12 +244,6 @@ def parse_args():
         "--lambda_d_msd", type=float, default=1.0, help="MSD discriminator loss weight"
     )
     parser.add_argument(
-        "--gan_crop_seconds",
-        type=float,
-        default=2.0,
-        help="Crop length (seconds) for MPD/MSD inputs. 0 or less uses min valid length in batch.",
-    )
-    parser.add_argument(
         "--lambda_multi_res_mel",
         type=float,
         default=15.0,
@@ -321,43 +315,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_gan_crops(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    audio_lengths: torch.Tensor,
-    max_len: int,
-    crop_samples: int,
-) -> tuple[torch.Tensor, torch.Tensor, int, float]:
-    """Build fixed-length random crops for GAN losses, excluding padded regions."""
-    lengths = torch.clamp(audio_lengths, min=1, max=max_len).to(dtype=torch.long)
-    min_valid_len = int(lengths.min().item())
-    if crop_samples > 0:
-        crop_len = min(crop_samples, min_valid_len)
-    else:
-        crop_len = min_valid_len
-    crop_len = max(crop_len, 1)
-
-    pred_crops = []
-    target_crops = []
-    for i in range(pred.shape[0]):
-        valid_len = int(lengths[i].item())
-        max_start = valid_len - crop_len
-        if max_start > 0:
-            start = int(
-                torch.randint(0, max_start + 1, (1,), device=pred.device).item()
-            )
-        else:
-            start = 0
-        end = start + crop_len
-        pred_crops.append(pred[i, start:end])
-        target_crops.append(target[i, start:end])
-
-    pred_gan = torch.stack(pred_crops, dim=0)
-    target_gan = torch.stack(target_crops, dim=0)
-    padding_ratio = 1.0 - (
-        lengths.float().sum().item() / float(lengths.numel() * max_len)
-    )
-    return pred_gan, target_gan, crop_len, padding_ratio
 
 
 class DecoderTrainingWrapper(nn.Module):
@@ -689,7 +646,6 @@ def save_checkpoint(
         "lambda_fm": args.lambda_fm,
         "lambda_d_mpd": args.lambda_d_mpd,
         "lambda_d_msd": args.lambda_d_msd,
-        "gan_crop_seconds": args.gan_crop_seconds,
         "lambda_multi_res_mel": args.lambda_multi_res_mel,
         "lambda_global_rms": args.lambda_global_rms,
     }
@@ -729,11 +685,6 @@ def main():
     # Mel loss (reconstruction component)
     target_sample_rate = BASE_SAMPLE_RATE * (
         args.extra_upsample_rate if args.add_48k_decoder_block else 1
-    )
-    gan_crop_samples = (
-        int(args.gan_crop_seconds * target_sample_rate)
-        if args.gan_crop_seconds > 0
-        else 0
     )
     multi_res_mel_loss_fn = MultiResolutionMelSpectrogramLoss(
         sample_rate=target_sample_rate
@@ -869,7 +820,6 @@ def main():
             "lambda_fm": args.lambda_fm,
             "lambda_d_mpd": args.lambda_d_mpd,
             "lambda_d_msd": args.lambda_d_msd,
-            "gan_crop_seconds": args.gan_crop_seconds,
             "lambda_multi_res_mel": args.lambda_multi_res_mel,
             "lambda_global_rms": args.lambda_global_rms,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
@@ -965,9 +915,6 @@ def main():
     mpd_grad_norm = 0.0
     msd_grad_norm = 0.0
     total_audio_sec = 0
-    gan_crop_len_samples = 0
-    padding_ratio = 0.0
-
     for epoch in range(start_epoch, args.num_epochs):
         accelerator.print(f"\n{'=' * 50}")
         accelerator.print(f"Epoch {epoch + 1}/{args.num_epochs}")
@@ -1005,19 +952,9 @@ def main():
             dg_msd = pred.new_zeros(())
 
             if args.use_gan:
-                pred_gan, target_gan, gan_crop_len_samples, padding_ratio = (
-                    build_gan_crops(
-                        pred=pred,
-                        target=target,
-                        audio_lengths=audio_lengths,
-                        max_len=min_len,
-                        crop_samples=gan_crop_samples,
-                    )
-                )
-
-                # Reshape to (B, 1, T) for discriminators (padding excluded by random crop)
-                pred_wav = pred_gan.unsqueeze(1)
-                target_wav = target_gan.unsqueeze(1)
+                # Reshape to (B, 1, T) for discriminators
+                pred_wav = pred.unsqueeze(1)
+                target_wav = target.unsqueeze(1)
 
                 # Align dtype with discriminator params (handles generator checkpoint
                 # loaded in bf16 when mixed_precision=no)
@@ -1144,10 +1081,6 @@ def main():
                                 "g/loss_adv": loss_g_adv.item(),
                                 "g/loss_fm": loss_fm.item(),
                                 "train/lr/discriminator": scheduler_d.get_last_lr()[0],
-                                "gan/crop_len_samples": gan_crop_len_samples,
-                                "gan/crop_len_seconds": gan_crop_len_samples
-                                / target_sample_rate,
-                                "gan/padding_ratio": padding_ratio,
                             }
                         )
                     accelerator.log(log_dict, step=global_step)
