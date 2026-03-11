@@ -216,6 +216,18 @@ def parse_args():
         "--warmup_steps", type=int, default=0, help="Number of warmup steps (lr goes from 0 to target lr)"
     )
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument(
+        "--beta1_g", type=float, default=0.8, help="Generator Adam beta1"
+    )
+    parser.add_argument(
+        "--beta2_g", type=float, default=0.99, help="Generator Adam beta2"
+    )
+    parser.add_argument(
+        "--beta1_d", type=float, default=0.8, help="Discriminator Adam beta1"
+    )
+    parser.add_argument(
+        "--beta2_d", type=float, default=0.99, help="Discriminator Adam beta2"
+    )
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -648,6 +660,10 @@ def save_checkpoint(
         "lambda_d_msd": args.lambda_d_msd,
         "lambda_multi_res_mel": args.lambda_multi_res_mel,
         "lambda_global_rms": args.lambda_global_rms,
+        "beta1_g": args.beta1_g,
+        "beta2_g": args.beta2_g,
+        "beta1_d": args.beta1_d,
+        "beta2_d": args.beta2_d,
     }
     with open(checkpoint_dir / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)
@@ -723,14 +739,14 @@ def main():
     optimizer_g = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr_g,
-        betas=(0.8, 0.99),
+        betas=(args.beta1_g, args.beta2_g),
         weight_decay=args.weight_decay,
     )
     if args.use_gan:
         optimizer_d = AdamW(
             list(mpd.parameters()) + list(msd.parameters()),
             lr=args.lr_d,
-            betas=(0.8, 0.99),
+            betas=(args.beta1_d, args.beta2_d),
             weight_decay=args.weight_decay,
         )
     else:
