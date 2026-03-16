@@ -9,13 +9,13 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets/val/*.tar"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
-RUN_NUMBER=12
+RUN_NUMBER=13
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards "${VAL_SHARDS}" \
     --output_dir "${OUTPUT_DIR}/run${RUN_NUMBER}" \
-    --resume_from "${OUTPUT_DIR}/run11/checkpoint-step-123750" \
+    --resume_from "${OUTPUT_DIR}/run12/checkpoint-step-130000" \
     --batch_size 8 \
     --train_full_decoder \
     --num_decoder_block_frozen 0 \
