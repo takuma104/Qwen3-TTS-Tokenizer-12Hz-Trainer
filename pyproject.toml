@@ -30,9 +30,11 @@ dependencies = [
   "resampy>=0.4.3",
   "torchcodec>=0.10.0",
   "pyloudnorm>=0.2.0",
+  "utmosv2",
 ]
 
 # third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
 [tool.uv.sources]
 flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+utmosv2 = { git = "https://github.com/sarulab-speech/UTMOSv2.git" }
 
