@@ -167,20 +167,21 @@ def compute_dg(
     mpd: HiFiGANMultiPeriodDiscriminator,
     msd: "SpecDiscriminator",
     device: torch.device,
-) -> float:
-    """Compute discriminator score dg for a waveform (higher = more realistic)."""
+) -> Tuple[float, float]:
+    """Compute discriminator scores for a waveform (higher = more realistic).
+
+    Returns (dg_mpd, dg_msd) separately.
+    """
     wav_t = torch.from_numpy(pred_wav).float().unsqueeze(0).unsqueeze(0).to(device)
 
-    mpd_outputs = mpd(wav_t)
-    msd_outputs = msd(wav_t)
-
-    dg_values = []
-    for outputs in [mpd_outputs, msd_outputs]:
+    def _mean_score(outputs) -> float:
+        vals = []
         for out_list in outputs:
             dg = out_list[-1]  # final layer output
-            dg_values.append(torch.mean(dg.float()).item())
+            vals.append(torch.mean(dg.float()).item())
+        return float(np.mean(vals)) if vals else float("nan")
 
-    return float(np.mean(dg_values)) if dg_values else float("nan")
+    return _mean_score(mpd(wav_t)), _mean_score(msd(wav_t))
 
 
 def load_checkpoint_decoder(
@@ -377,7 +378,8 @@ METRIC_LABELS = {
     "multi_res_mel": "Multi-Res Mel Loss (lower=better)",
     "utmos": "UTMOSv2 Score (higher=better)",
     "mcd": "MCD [dB] - Mel Cepstral Distortion (lower=better)",
-    "dg": "Discriminator Score dg (higher=better)",
+    "dg_mpd": "MPD Discriminator Score (higher=better)",
+    "dg_msd": "MSD Discriminator Score (higher=better)",
 }
 
 
@@ -603,7 +605,8 @@ def main():
         metric_lists: Dict[str, List[float]] = {
             "multi_res_mel": [],
             "mcd": [],
-            "dg": [],
+            "dg_mpd": [],
+            "dg_msd": [],
         }
         if utmos_predictor is not None:
             metric_lists["utmos"] = []
@@ -637,10 +640,12 @@ def main():
                 # --- dg (fixed discriminator) ---
                 if disc_pair is not None:
                     mpd_disc, msd_disc = disc_pair
-                    dg_val = compute_dg(pred_trim, mpd_disc, msd_disc, device)
-                    metric_lists["dg"].append(dg_val)
+                    dg_mpd_val, dg_msd_val = compute_dg(pred_trim, mpd_disc, msd_disc, device)
+                    metric_lists["dg_mpd"].append(dg_mpd_val)
+                    metric_lists["dg_msd"].append(dg_msd_val)
                 else:
-                    metric_lists["dg"].append(float("nan"))
+                    metric_lists["dg_mpd"].append(float("nan"))
+                    metric_lists["dg_msd"].append(float("nan"))
 
                 # --- UTMOS ---
                 if utmos_predictor is not None:
