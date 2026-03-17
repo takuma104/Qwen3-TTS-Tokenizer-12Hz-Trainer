@@ -184,6 +184,37 @@ def compute_dg(
     return _mean_score(mpd(wav_t)), _mean_score(msd(wav_t))
 
 
+@torch.no_grad()
+def compute_dg_batch(
+    pred_wavs: List[np.ndarray],
+    mpd: HiFiGANMultiPeriodDiscriminator,
+    msd: "SpecDiscriminator",
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute discriminator scores for a batch of waveforms (higher = more realistic).
+
+    Returns (dg_mpd_scores, dg_msd_scores) as numpy arrays of shape [B].
+    """
+    max_len = max(len(w) for w in pred_wavs)
+    batch_size = len(pred_wavs)
+    padded = np.zeros((batch_size, max_len), dtype=np.float32)
+    for i, w in enumerate(pred_wavs):
+        padded[i, :len(w)] = w
+
+    wav_t = torch.from_numpy(padded).float().unsqueeze(1).to(device)  # [B, 1, T]
+
+    def _per_sample_mean_scores(outputs) -> np.ndarray:
+        scores = []
+        for out_list in outputs:
+            dg = out_list[-1].float()  # [B, C, T']
+            per_sample = dg.mean(dim=list(range(1, dg.dim())))  # [B]
+            scores.append(per_sample)
+        stacked = torch.stack(scores)  # [n_disc, B]
+        return stacked.mean(dim=0).cpu().numpy()  # [B]
+
+    return _per_sample_mean_scores(mpd(wav_t)), _per_sample_mean_scores(msd(wav_t))
+
+
 def load_checkpoint_decoder(
     base_tokenizer: Qwen3TTSTokenizer,
     checkpoint_path: str,
@@ -264,6 +295,83 @@ def decode_with_base_tokenizer(
         wav = librosa.resample(wav, orig_sr=native_sr, target_sr=target_sr)
 
     return wav, target_sr
+
+
+def _batch_decode(
+    code_list: List[np.ndarray],
+    decoder: nn.Module,
+    output_sr: int,
+    device: torch.device,
+) -> List[Tuple[np.ndarray, int]]:
+    """Batch-decode a list of code arrays using a decoder module.
+
+    Pads codes to the same length, runs a single batched forward pass,
+    then trims each output to the expected per-sample length.
+    """
+    if not code_list:
+        return []
+
+    seq_lens = [codes.shape[0] for codes in code_list]
+    max_seq_len = max(seq_lens)
+
+    padded = []
+    for codes in code_list:
+        codes_t = torch.from_numpy(codes).long()  # [seq_len, 16]
+        pad_len = max_seq_len - codes_t.shape[0]
+        if pad_len > 0:
+            codes_t = torch.nn.functional.pad(codes_t, (0, 0, 0, pad_len))
+        padded.append(codes_t)
+
+    batch_t = torch.stack(padded).transpose(1, 2).to(device)  # [B, 16, max_seq_len]
+
+    with torch.no_grad():
+        wav_batch = decoder(batch_t)  # [B, 1, T] or [B, T]
+
+    if wav_batch.dim() == 3:
+        wav_batch = wav_batch.squeeze(1)  # [B, T]
+    wav_batch = wav_batch.float().cpu().numpy()
+    total_out_len = wav_batch.shape[-1]
+
+    results = []
+    for i, seq_len in enumerate(seq_lens):
+        expected_len = round(seq_len / max_seq_len * total_out_len)
+        results.append((wav_batch[i, :expected_len], output_sr))
+
+    return results
+
+
+def batch_decode_with_decoder(
+    code_list: List[np.ndarray],
+    decoder: Qwen3TTSTokenizerV2Decoder,
+    base_tokenizer: Qwen3TTSTokenizer,
+    ckpt_config: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> List[Tuple[np.ndarray, int]]:
+    """Batch decode using a checkpoint decoder."""
+    extra_upsample_rate = ckpt_config.get("extra_upsample_rate", 2)
+    output_sr = base_tokenizer.config.output_sample_rate * extra_upsample_rate
+    return _batch_decode(code_list, decoder, output_sr, device)
+
+
+def batch_decode_with_base_tokenizer(
+    code_list: List[np.ndarray],
+    base_tokenizer: Qwen3TTSTokenizer,
+    device: torch.device,
+    target_sr: int = 48000,
+) -> List[Tuple[np.ndarray, int]]:
+    """Batch decode using the base tokenizer, resampled to target_sr."""
+    native_sr = base_tokenizer.config.output_sample_rate
+    results = _batch_decode(code_list, base_tokenizer.model.decoder, native_sr, device)
+
+    if native_sr != target_sr:
+        resampled = []
+        for wav, _sr in results:
+            wav = librosa.resample(wav, orig_sr=native_sr, target_sr=target_sr)
+            resampled.append((wav, target_sr))
+        return resampled
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +622,12 @@ def parse_args():
         default=48000,
         help="Target sample rate for output (default: 48000)",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=16,
+        help="Batch size for decoding and discriminator evaluation (default: 16)",
+    )
     return parser.parse_args()
 
 
@@ -595,11 +709,12 @@ def main():
     # ---- Helper: evaluate a decode function on valid_pairs --------------------
     def evaluate_decoder(
         name: str,
-        decode_fn,
+        batch_decode_fn,
         valid_pairs: List,
+        batch_size: int = 16,
     ) -> Dict[str, List[float]]:
         print(f"\n{'='*60}")
-        print(f"Evaluating: {name}")
+        print(f"Evaluating: {name}  (batch_size={batch_size})")
         print(f"{'='*60}")
 
         metric_lists: Dict[str, List[float]] = {
@@ -611,51 +726,104 @@ def main():
         if utmos_predictor is not None:
             metric_lists["utmos"] = []
 
-        for codes, (orig_array, orig_sr) in tqdm(valid_pairs, desc=name):
+        # Accumulate decoded waveforms for deferred UTMOS computation
+        all_pred_for_utmos: List[np.ndarray] = []
+        all_pred_sr_for_utmos: List[int] = []
+
+        num_batches = (len(valid_pairs) + batch_size - 1) // batch_size
+
+        for batch_idx in tqdm(range(num_batches), desc=name):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, len(valid_pairs))
+            batch_pairs = valid_pairs[start:end]
+            cur_batch_size = end - start
+
+            batch_codes = [codes for codes, _ in batch_pairs]
+            batch_refs = [(orig_array, orig_sr) for _, (orig_array, orig_sr) in batch_pairs]
+
             try:
-                pred_wav, pred_sr = decode_fn(codes)
+                # --- Batch decode ---
+                decoded = batch_decode_fn(batch_codes)
 
-                # Resample original to pred_sr for fair comparison
-                if orig_sr != pred_sr:
-                    target_ref = librosa.resample(orig_array, orig_sr=orig_sr, target_sr=pred_sr)
-                else:
-                    target_ref = orig_array.copy()
+                # Prepare trimmed pred/ref pairs
+                pred_trimmed = []
+                ref_trimmed = []
+                pred_srs = []
+                for (pred_wav, pred_sr), (orig_array, orig_sr) in zip(decoded, batch_refs):
+                    if orig_sr != pred_sr:
+                        target_ref = librosa.resample(orig_array, orig_sr=orig_sr, target_sr=pred_sr)
+                    else:
+                        target_ref = orig_array.copy()
+                    min_len = min(len(pred_wav), len(target_ref))
+                    pred_trimmed.append(pred_wav[:min_len])
+                    ref_trimmed.append(target_ref[:min_len])
+                    pred_srs.append(pred_sr)
 
-                # Align length
-                min_len = min(len(pred_wav), len(target_ref))
-                pred_trim = pred_wav[:min_len]
-                ref_trim = target_ref[:min_len]
+                # Use temporary buffers so partial results don't corrupt metric_lists
+                batch_mel = []
+                batch_mcd = []
+                batch_dg_mpd = []
+                batch_dg_msd = []
 
-                # --- multi_res_mel ---
-                pred_t = torch.from_numpy(pred_trim).float().unsqueeze(0).to(device)
-                ref_t = torch.from_numpy(ref_trim).float().unsqueeze(0).to(device)
-                with torch.no_grad():
-                    mel_val = mel_loss_fn(pred_t, ref_t).item()
-                metric_lists["multi_res_mel"].append(mel_val)
+                # --- multi_res_mel (per-sample on GPU) ---
+                for pred_trim, ref_trim in zip(pred_trimmed, ref_trimmed):
+                    pred_t = torch.from_numpy(pred_trim).float().unsqueeze(0).to(device)
+                    ref_t = torch.from_numpy(ref_trim).float().unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        mel_val = mel_loss_fn(pred_t, ref_t).item()
+                    batch_mel.append(mel_val)
 
-                # --- MCD ---
-                mcd_val = mcd_score(pred_trim, ref_trim, pred_sr)
-                metric_lists["mcd"].append(mcd_val)
+                # --- MCD (per-sample, CPU-bound) ---
+                for pred_trim, ref_trim, pred_sr in zip(pred_trimmed, ref_trimmed, pred_srs):
+                    mcd_val = mcd_score(pred_trim, ref_trim, pred_sr)
+                    batch_mcd.append(mcd_val)
 
-                # --- dg (fixed discriminator) ---
+                # --- dg (batched discriminator) ---
                 if disc_pair is not None:
                     mpd_disc, msd_disc = disc_pair
-                    dg_mpd_val, dg_msd_val = compute_dg(pred_trim, mpd_disc, msd_disc, device)
-                    metric_lists["dg_mpd"].append(dg_mpd_val)
-                    metric_lists["dg_msd"].append(dg_msd_val)
+                    dg_mpd_vals, dg_msd_vals = compute_dg_batch(
+                        pred_trimmed, mpd_disc, msd_disc, device
+                    )
+                    batch_dg_mpd = dg_mpd_vals.tolist()
+                    batch_dg_msd = dg_msd_vals.tolist()
                 else:
-                    metric_lists["dg_mpd"].append(float("nan"))
-                    metric_lists["dg_msd"].append(float("nan"))
+                    batch_dg_mpd = [float("nan")] * cur_batch_size
+                    batch_dg_msd = [float("nan")] * cur_batch_size
 
-                # --- UTMOS ---
+                # All metrics succeeded — commit to metric_lists
+                metric_lists["multi_res_mel"].extend(batch_mel)
+                metric_lists["mcd"].extend(batch_mcd)
+                metric_lists["dg_mpd"].extend(batch_dg_mpd)
+                metric_lists["dg_msd"].extend(batch_dg_msd)
+
+                # Accumulate for deferred UTMOS
                 if utmos_predictor is not None:
-                    mos = utmos_predictor.predict(data=pred_trim, sr=pred_sr, device=device, num_workers=0, verbose=False)
-                    metric_lists["utmos"].append(float(mos.item() if hasattr(mos, 'item') else mos))
+                    all_pred_for_utmos.extend(pred_trimmed)
+                    all_pred_sr_for_utmos.extend(pred_srs)
 
             except Exception as e:
-                warnings.warn(f"Metric computation failed: {e}")
+                warnings.warn(f"Batch metric computation failed: {e}")
+                nan_fill = [float("nan")] * cur_batch_size
                 for k in metric_lists:
-                    metric_lists[k].append(float("nan"))
+                    if k != "utmos":
+                        metric_lists[k].extend(nan_fill)
+                if utmos_predictor is not None:
+                    all_pred_for_utmos.extend([np.zeros(1, dtype=np.float32)] * cur_batch_size)
+                    all_pred_sr_for_utmos.extend([args.target_sample_rate] * cur_batch_size)
+
+        # --- UTMOS (deferred, single call for all samples) ---
+        if utmos_predictor is not None and all_pred_for_utmos:
+            print(f"  Computing UTMOS for {len(all_pred_for_utmos)} samples...")
+            max_wav_len = max(len(p) for p in all_pred_for_utmos)
+            utmos_data = np.zeros((len(all_pred_for_utmos), max_wav_len), dtype=np.float32)
+            for i, p in enumerate(all_pred_for_utmos):
+                utmos_data[i, :len(p)] = p
+            mos_scores = utmos_predictor.predict(
+                data=utmos_data, sr=all_pred_sr_for_utmos[0], device=device,
+                num_workers=4, verbose=True,
+            )
+            for s in mos_scores:
+                metric_lists["utmos"].append(float(s.item() if hasattr(s, 'item') else s))
 
         # Per-entry summary
         print(f"\n  Summary for {name}:")
@@ -678,8 +846,11 @@ def main():
     all_names.append(baseline_name)
     results[baseline_name] = evaluate_decoder(
         baseline_name,
-        lambda codes: decode_with_base_tokenizer(codes, base_tokenizer, device, args.target_sample_rate),
+        lambda code_list: batch_decode_with_base_tokenizer(
+            code_list, base_tokenizer, device, args.target_sample_rate
+        ),
         valid_pairs,
+        args.batch_size,
     )
 
     # ---- Evaluate each checkpoint -------------------------------------------
@@ -693,10 +864,11 @@ def main():
 
         results[ckpt_name] = evaluate_decoder(
             ckpt_name,
-            lambda codes, _dec=decoder, _cfg=ckpt_config: decode_with_decoder(
-                _dec, codes, base_tokenizer, _cfg, device, dtype
+            lambda code_list, _dec=decoder, _cfg=ckpt_config: batch_decode_with_decoder(
+                code_list, _dec, base_tokenizer, _cfg, device, dtype
             ),
             valid_pairs,
+            args.batch_size,
         )
 
     # ---- Save raw data CSV --------------------------------------------------
