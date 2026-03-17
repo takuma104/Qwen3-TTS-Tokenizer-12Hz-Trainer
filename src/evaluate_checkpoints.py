@@ -4,7 +4,7 @@
 """
 Checkpoint Evaluation Script
 
-Evaluates multiple training checkpoints on HuggingFace dataset audio,
+Evaluates multiple training checkpoints on WebDataset audio,
 comparing them across 4 metrics:
   - multi_res_mel: multi-resolution mel spectrogram loss (lower is better)
   - utmos: neural MOS prediction, 0-5 scale (higher is better)  [optional]
@@ -14,8 +14,7 @@ comparing them across 4 metrics:
 Usage:
     python evaluate_checkpoints.py \\
         --checkpoints ../output/run8/checkpoint-step-1000 ../output/run8/checkpoint-best \\
-        --hf_dataset mozilla-foundation/common_voice_17_0 \\
-        --hf_config ja \\
+        --shard_pattern "../data/shards-{000000..000010}.tar" \\
         --num_samples 200 \\
         --output_dir ../eval_results/comparison
 """
@@ -267,137 +266,107 @@ def decode_with_base_tokenizer(
 
 
 # ---------------------------------------------------------------------------
-# HF Dataset loading
+# WebDataset loading
 # ---------------------------------------------------------------------------
 
 
-def load_hf_audio_samples(
-    dataset_name: str,
-    config: Optional[str],
-    split: str,
-    audio_column: str,
+def load_webdataset_samples(
+    shard_pattern: str,
+    target_sample_rate: int,
     num_samples: int,
-    min_duration: float = 3.0,
+    min_duration: float = 1.0,
     max_duration: float = 10.0,
-) -> List[Tuple[np.ndarray, int]]:
-    """Load audio samples from a HuggingFace dataset (streaming)."""
-    from datasets import load_dataset
+    token_per_second: float = 12.5,
+) -> List[Tuple[np.ndarray, np.ndarray, int]]:
+    """Load samples from WebDataset, returning (audio_codes, audio, sample_rate).
 
-    from datasets import Audio
+    Each sample contains pre-encoded audio_codes (.npy) and original audio
+    (.wav/.mp3/.flac/.ogg/.opus). Audio is resampled to target_sample_rate.
 
-    print(f"\nLoading HF dataset: {dataset_name}" + (f" ({config})" if config else ""))
-    load_kwargs = dict(split=split, streaming=True, trust_remote_code=True)
-    if config:
-        ds = load_dataset(dataset_name, config, **load_kwargs)
+    Returns list of (audio_codes [seq_len, 16], audio_array, target_sample_rate).
+    """
+    import glob as glob_mod
+    import io
+
+    import webdataset as wds
+
+    # Expand glob pattern if applicable
+    if "*" in shard_pattern and "{" not in shard_pattern:
+        expanded_files = sorted(glob_mod.glob(shard_pattern))
+        if not expanded_files:
+            print(f"[ERROR] No files found matching pattern: {shard_pattern}")
+            return []
+        print(f"Found {len(expanded_files)} tar files")
+        pattern = expanded_files
     else:
-        ds = load_dataset(dataset_name, **load_kwargs)
+        pattern = shard_pattern
 
-    # Force audio column to decode as {"array": ndarray, "sampling_rate": int}.
-    # Newer datasets versions return AudioDecoder objects instead of dicts.
-    ds = ds.cast_column(audio_column, Audio())
+    print(f"\nLoading WebDataset: {shard_pattern}")
+
+    dataset = (
+        wds.WebDataset(pattern, shardshuffle=False)
+        .decode("rgb")
+    )
 
     samples = []
-    skipped_col = 0
     skipped_dur = 0
     skipped_rms = 0
-    first_item = True
-    for item in tqdm(ds, desc="Loading audio", total=num_samples):
+    skipped_audio = 0
+
+    for sample in tqdm(dataset, desc="Loading samples", total=num_samples):
         if len(samples) >= num_samples:
             break
 
-        # On first item, show available columns to help diagnose wrong column names
-        if first_item:
-            first_item = False
-            cols = list(item.keys())
-            print(f"  Dataset columns: {cols}")
-            if audio_column not in cols:
-                print(
-                    f"  [ERROR] Column '{audio_column}' not found! "
-                    f"Use --hf_audio_column to specify the correct column.\n"
-                    f"  Available columns: {cols}"
-                )
-
-        audio_data = item.get(audio_column)
-        if audio_data is None:
-            skipped_col += 1
+        # Load audio_codes
+        audio_codes = sample.get("npy")
+        if audio_codes is None:
             continue
+        assert isinstance(audio_codes, np.ndarray), "audio_codes must be a numpy array"
+        assert audio_codes.ndim == 1
+        audio_codes = audio_codes.reshape(-1, 16)  # (seq_len, 16)
 
-        array = audio_data["array"]
-        sr = audio_data["sampling_rate"]
-        array = np.array(array, dtype=np.float32) if not isinstance(array, np.ndarray) else array.astype(np.float32)
-
-        # Mono
-        if array.ndim > 1:
-            array = array.mean(axis=-1)
-
-        duration = len(array) / sr
-        if duration < min_duration or duration > max_duration:
+        # Duration filter via code length
+        num_codes = audio_codes.shape[0]
+        min_codes = int(token_per_second * min_duration)
+        max_codes = int(token_per_second * max_duration)
+        if num_codes < min_codes or num_codes > max_codes:
             skipped_dur += 1
             continue
 
+        # Get audio data (support multiple formats)
+        audio_data = None
+        for ext in ["wav", "mp3", "flac", "ogg", "opus"]:
+            if ext in sample:
+                audio_data = sample[ext]
+                break
+
+        if audio_data is None:
+            skipped_audio += 1
+            continue
+
+        # Load with librosa
+        audio, sr = librosa.load(io.BytesIO(audio_data), sr=None, mono=True)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=-1)
+        audio = audio.astype(np.float32)
+
+        # Resample to target sample rate
+        if sr != target_sample_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sample_rate)
+
         # RMS filter
-        rms = np.sqrt(np.mean(array ** 2))
+        rms = np.sqrt(np.mean(audio ** 2))
         if rms < 1e-4:  # ~ -80 dB
             skipped_rms += 1
             continue
 
-        samples.append((array, sr))
+        samples.append((audio_codes, audio, target_sample_rate))
 
     print(
         f"  Collected {len(samples)} valid samples  "
-        f"(skipped: col={skipped_col}, duration={skipped_dur}, rms={skipped_rms})"
+        f"(skipped: duration={skipped_dur}, no_audio={skipped_audio}, rms={skipped_rms})"
     )
     return samples
-
-
-# ---------------------------------------------------------------------------
-# Encoding
-# ---------------------------------------------------------------------------
-
-
-TOKENIZER_SR = 24000  # Qwen3TTS tokenizer input sample rate (same as hf_to_webdataset.py)
-
-
-def encode_samples(
-    samples: List[Tuple[np.ndarray, int]],
-    base_tokenizer: Qwen3TTSTokenizer,
-) -> List[Optional[np.ndarray]]:
-    """Encode audio samples to audio_codes using the base tokenizer.
-
-    Resamples each sample to TOKENIZER_SR (24kHz) and calls
-    tokenizer.encode(audios=..., sr=...) as in hf_to_webdataset.py.
-    Returns list of audio_codes arrays (shape [seq_len, 16]), or None on failure.
-    """
-    audio_codes_list = []
-    print("\nEncoding audio samples (once, shared across all checkpoints)...")
-
-    for array, sr in tqdm(samples, desc="Encoding"):
-        try:
-            # Resample to tokenizer input SR (24 kHz)
-            if sr != TOKENIZER_SR:
-                audio_24k = librosa.resample(array, orig_sr=sr, target_sr=TOKENIZER_SR)
-            else:
-                audio_24k = array
-
-            encoded = base_tokenizer.encode(audios=[audio_24k], sr=TOKENIZER_SR)
-            codes = encoded.audio_codes[0].cpu().numpy()  # shape varies by model
-
-            # Normalize to [seq_len, 16]
-            if codes.ndim == 1:
-                codes = codes.reshape(-1, 16)
-            elif codes.ndim == 2 and codes.shape[0] == 16:
-                codes = codes.T  # [16, seq_len] → [seq_len, 16]
-            elif codes.ndim == 3:
-                codes = codes.squeeze(0).reshape(-1, 16)
-
-            audio_codes_list.append(codes)
-        except Exception as e:
-            print(f"  [ERROR] Encoding failed: {type(e).__name__}: {e}")
-            audio_codes_list.append(None)
-
-    valid = sum(1 for c in audio_codes_list if c is not None)
-    print(f"  Encoded {valid}/{len(samples)} samples successfully")
-    return audio_codes_list
 
 
 # ---------------------------------------------------------------------------
@@ -502,20 +471,15 @@ def plot_violin_box(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate multiple checkpoints on HF audio data")
+    parser = argparse.ArgumentParser(description="Evaluate multiple checkpoints on WebDataset audio")
     parser.add_argument(
         "--checkpoints", nargs="+", required=True, help="List of checkpoint directory paths"
     )
     parser.add_argument(
-        "--hf_dataset",
+        "--shard_pattern",
         type=str,
         required=True,
-        help='HuggingFace dataset name (e.g., "mozilla-foundation/common_voice_17_0")',
-    )
-    parser.add_argument("--hf_config", type=str, default=None, help="HF dataset config/language")
-    parser.add_argument("--hf_split", type=str, default="train", help="Dataset split (default: train)")
-    parser.add_argument(
-        "--hf_audio_column", type=str, default="audio", help="Audio column name (default: audio)"
+        help='WebDataset shard pattern (e.g., "data/shards-{000000..000010}.tar" or "data/*.tar")',
     )
     parser.add_argument(
         "--num_samples", type=int, default=200, help="Number of audio samples to evaluate"
@@ -608,29 +572,23 @@ def main():
         sample_rate=args.target_sample_rate
     ).to(device)
 
-    # ---- Load HF audio samples ----------------------------------------------
-    raw_samples = load_hf_audio_samples(
-        dataset_name=args.hf_dataset,
-        config=args.hf_config,
-        split=args.hf_split,
-        audio_column=args.hf_audio_column,
+    # ---- Load WebDataset samples (audio_codes + audio already available) ------
+    wds_samples = load_webdataset_samples(
+        shard_pattern=args.shard_pattern,
+        target_sample_rate=args.target_sample_rate,
         num_samples=args.num_samples,
     )
 
-    if len(raw_samples) == 0:
-        print("[ERROR] No valid audio samples loaded.")
+    if len(wds_samples) == 0:
+        print("[ERROR] No valid samples loaded from WebDataset.")
         sys.exit(1)
 
-    # ---- Encode all samples once ---------------------------------------------
-    audio_codes_list = encode_samples(raw_samples, base_tokenizer)
-
-    # Filter out failed encodings
+    # Build valid_pairs: list of (audio_codes_np, (audio_np, sample_rate))
     valid_pairs = [
-        (codes, raw_samples[i])
-        for i, codes in enumerate(audio_codes_list)
-        if codes is not None
+        (codes, (audio, sr))
+        for codes, audio, sr in wds_samples
     ]
-    print(f"\nEvaluating on {len(valid_pairs)} successfully encoded samples")
+    print(f"\nEvaluating on {len(valid_pairs)} samples")
 
     # ---- Helper: evaluate a decode function on valid_pairs --------------------
     def evaluate_decoder(
