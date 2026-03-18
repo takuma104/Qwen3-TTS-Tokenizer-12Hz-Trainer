@@ -546,34 +546,78 @@ def eval_step(
     mel_loss_fn: MultiResolutionMelSpectrogramLoss,
     dataloader: DataLoader,
     accelerator: Accelerator,
+    mpd: "nn.Module | None" = None,
+    msd: "nn.Module | None" = None,
     max_batches: int = 50,
 ) -> dict:
-    """Evaluation (mel loss only)."""
+    """Evaluation (mel loss + optional discriminator stats)."""
     model.eval()
+    if mpd is not None:
+        mpd.eval()
+    if msd is not None:
+        msd.eval()
 
     total_mel_loss = 0.0
+    total_dr_mpd = 0.0
+    total_dg_mpd = 0.0
+    total_dr_msd = 0.0
+    total_dg_msd = 0.0
     num_batches = 0
 
-    for batch in dataloader:
-        if num_batches >= max_batches:
-            break
+    with torch.no_grad():
+        for batch in dataloader:
+            if num_batches >= max_batches:
+                break
 
-        audio_codes = batch["audio_codes"].to(accelerator.device).transpose(1, 2)
-        target_audio = batch["audio"].to(accelerator.device)
-        audio_lengths = batch["audio_lengths"].to(accelerator.device)
+            audio_codes = batch["audio_codes"].to(accelerator.device).transpose(1, 2)
+            target_audio = batch["audio"].to(accelerator.device)
+            audio_lengths = batch["audio_lengths"].to(accelerator.device)
 
-        pred_48k = model(audio_codes)
+            pred_48k = model(audio_codes)
 
-        # Align shapes and mask padding
-        pred, target, min_len = align_audio(pred_48k, target_audio)
-        pred, target = apply_length_mask(pred, target, audio_lengths, min_len)
+            # Align shapes and mask padding
+            pred, target, min_len = align_audio(pred_48k, target_audio)
+            pred, target = apply_length_mask(pred, target, audio_lengths, min_len)
 
-        mel_loss = mel_loss_fn(pred, target)
-        total_mel_loss += mel_loss.item()
-        num_batches += 1
+            mel_loss = mel_loss_fn(pred, target)
+            total_mel_loss += mel_loss.item()
+
+            # Discriminator d_r / d_g stats
+            if mpd is not None and msd is not None:
+                pred_wav = pred.unsqueeze(1)
+                target_wav = target.unsqueeze(1)
+
+                _, dr_mpd, dg_mpd = discriminator_loss(
+                    mpd(target_wav), mpd(pred_wav)
+                )
+                _, dr_msd, dg_msd = discriminator_loss(
+                    msd(target_wav), msd(pred_wav)
+                )
+                total_dr_mpd += dr_mpd.item()
+                total_dg_mpd += dg_mpd.item()
+                total_dr_msd += dr_msd.item()
+                total_dg_msd += dg_msd.item()
+
+            num_batches += 1
 
     model.train()
-    return {"val/loss_multi_res_mel": total_mel_loss / max(num_batches, 1)}
+    if mpd is not None:
+        mpd.train()
+    if msd is not None:
+        msd.train()
+
+    n = max(num_batches, 1)
+    result = {"val/loss_multi_res_mel": total_mel_loss / n}
+    if mpd is not None and msd is not None:
+        result.update(
+            {
+                "val/d_mpd/dr": total_dr_mpd / n,
+                "val/d_mpd/dg": total_dg_mpd / n,
+                "val/d_msd/dr": total_dr_msd / n,
+                "val/d_msd/dg": total_dg_msd / n,
+            }
+        )
+    return result
 
 
 def save_checkpoint(
@@ -1135,6 +1179,8 @@ def main():
                                 "d_msd/dg": dg_msd.item(),
                                 "g/loss_adv": loss_g_adv.item(),
                                 "g/loss_fm": loss_fm.item(),
+                                "g/loss_fm_mpd": loss_fm_mpd.item(),
+                                "g/loss_fm_msd": loss_fm_msd.item(),
                                 "train/lr/discriminator": scheduler_d.get_last_lr()[0],
                             }
                         )
@@ -1157,7 +1203,12 @@ def main():
                     and global_step > 0
                 ):
                     val_losses = eval_step(
-                        model, multi_res_mel_loss_fn, val_dataloader, accelerator
+                        model,
+                        multi_res_mel_loss_fn,
+                        val_dataloader,
+                        accelerator,
+                        mpd=mpd if args.use_gan else None,
+                        msd=msd if args.use_gan else None,
                     )
                     accelerator.print(
                         f"\nStep {global_step} - Validation: {val_losses}"
