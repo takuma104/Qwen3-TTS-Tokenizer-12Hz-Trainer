@@ -73,6 +73,7 @@ from losses import (
     generator_adversarial_loss,
     discriminator_loss,
     feature_matching_loss,
+    d_r1_loss,
 )
 from qwen_tts import Qwen3TTSTokenizer
 from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
@@ -255,6 +256,28 @@ def parse_args():
     parser.add_argument(
         "--lambda_d_msd", type=float, default=1.0, help="MSD discriminator loss weight"
     )
+
+    # R1 gradient penalty (lazy discriminator regularization, StyleGAN2-style)
+    # NOTE: g_regularize (StyleGAN2 path length) is not implemented here —
+    # the generator receives discrete acoustic codes through a frozen quantizer;
+    # there is no continuous style latent over which to compute a meaningful
+    # path length. HiFiGAN, EnCodec, Vocos etc. do not use path length reg.
+    parser.add_argument(
+        "--r1",
+        type=float,
+        default=10.0,
+        help="Weight of R1 gradient penalty on discriminators. 0 disables R1.",
+    )
+    parser.add_argument(
+        "--d_reg_every",
+        type=int,
+        default=0,
+        help=(
+            "Apply R1 discriminator regularization every N optimizer steps "
+            "(lazy regularization, StyleGAN2 default: 16)."
+        ),
+    )
+
     parser.add_argument(
         "--lambda_multi_res_mel",
         type=float,
@@ -745,6 +768,8 @@ def save_checkpoint(
         "beta2_g": args.beta2_g,
         "beta1_d": args.beta1_d,
         "beta2_d": args.beta2_d,
+        "r1": args.r1,
+        "d_reg_every": args.d_reg_every,
     }
     with open(checkpoint_dir / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)
@@ -848,10 +873,17 @@ def main():
         weight_decay=args.weight_decay,
     )
     if args.use_gan:
+        # Lazy regularization ratio: adjusts lr and betas so that the expected
+        # update magnitude is the same as applying R1 every step.
+        # (StyleGAN2: d_reg_ratio = d_reg_every / (d_reg_every + 1))
+        if args.r1 > 0 and args.d_reg_every > 1:
+            d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
+        else:
+            d_reg_ratio = 1.0
         optimizer_d = AdamW(
             list(mpd.parameters()) + list(msd.parameters()),
-            lr=args.lr_d,
-            betas=(args.beta1_d, args.beta2_d),
+            lr=args.lr_d * d_reg_ratio,
+            betas=(args.beta1_d ** d_reg_ratio, args.beta2_d ** d_reg_ratio),
             weight_decay=args.weight_decay,
         )
     else:
@@ -947,6 +979,8 @@ def main():
             "extra_upsample_rate": args.extra_upsample_rate,
             "max_audio_length": args.max_audio_length,
             "training_type": "gan" if args.use_gan else "reconstruction",
+            "r1": args.r1,
+            "d_reg_every": args.d_reg_every,
         }
         if args.log_with == "wandb":
             accelerator.init_trackers(
@@ -1044,6 +1078,7 @@ def main():
     # Persistent across optimizer-step logs.
     mpd_grad_norm = 0.0
     msd_grad_norm = 0.0
+    r1_loss_val = 0.0  # last computed R1 penalty (persists between reg steps)
     total_audio_sec = 0
     for epoch in range(start_epoch, args.num_epochs):
         accelerator.print(f"\n{'=' * 50}")
@@ -1126,6 +1161,42 @@ def main():
                     accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
                     optimizer_d.step()
                     scheduler_d.step()
+
+                # =====================
+                # R1 Discriminator Regularization
+                # (lazy: every d_reg_every optimizer steps, scaled by d_reg_every)
+                # =====================
+                if args.use_gan and args.r1 > 0 and accelerator.sync_gradients and (global_step + 1) % args.d_reg_every == 0:
+                    # Cast to float32: bf16 mixed precision + STFT autodiff can
+                    # cause numerical instability with create_graph=True.
+                    target_wav_r1 = target_wav.detach().float().requires_grad_(True)
+
+                    mpd_real_r1 = mpd(target_wav_r1)
+                    r1_mpd = d_r1_loss(mpd_real_r1, target_wav_r1)
+
+                    msd_real_r1 = msd(target_wav_r1)
+                    r1_msd = d_r1_loss(msd_real_r1, target_wav_r1)
+
+                    r1_total = r1_mpd + r1_msd
+
+                    # Lazy scaling: weight * d_reg_every keeps expected value equal
+                    # to applying R1 every step.
+                    # The `0 * anchor` terms keep the autograd graph connected so
+                    # accelerator.backward() can flush properly.
+                    r1_loss_scaled = (
+                        (args.r1 / 2) * r1_total * args.d_reg_every
+                        + 0.0 * mpd_real_r1[0][-1].sum()
+                        + 0.0 * msd_real_r1[0][-1].sum()
+                    )
+
+                    optimizer_d.zero_grad()
+                    accelerator.backward(r1_loss_scaled)
+                    accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
+                    optimizer_d.step()
+                    # NOTE: scheduler_d.step() is NOT called here — the LR scheduler
+                    # steps only on the main D loss, not on the regularization pass.
+
+                    r1_loss_val = r1_total.item()
 
                 # =====================
                 # Generator update
@@ -1248,6 +1319,7 @@ def main():
                                 "g/loss_fm_mpd": loss_fm_mpd.item(),
                                 "g/loss_fm_msd": loss_fm_msd.item(),
                                 "train/lr/discriminator": scheduler_d.get_last_lr()[0],
+                                "d/r1_loss": r1_loss_val,
                             }
                         )
                     accelerator.log(log_dict, step=global_step)
