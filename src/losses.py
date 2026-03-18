@@ -83,6 +83,33 @@ def discriminator_loss(
     return loss, dr_total / n, dg_total / n
 
 
+def d_r1_loss(
+    disc_real_outputs: List[List[torch.Tensor]],
+    real_input: torch.Tensor,
+) -> torch.Tensor:
+    """R1 gradient penalty for discriminator regularization.
+
+    Penalizes the L2 norm of the discriminator's output gradient w.r.t. the
+    real input waveform. Applied lazily every d_reg_every steps (StyleGAN2-style).
+
+    Args:
+        disc_real_outputs: Return value of mpd(real_input) or msd(real_input).
+                           List[List[Tensor]] — outer: sub-discriminators,
+                           inner: feature maps, last element is final output.
+        real_input: Waveform tensor passed to the discriminator,
+                    must have requires_grad=True.
+
+    Returns:
+        Scalar R1 penalty.
+    """
+    total_real = sum(sub_out[-1].sum() for sub_out in disc_real_outputs)
+    (grad_real,) = torch.autograd.grad(
+        outputs=total_real, inputs=real_input, create_graph=True
+    )
+    # grad_real: (B, 1, T)
+    return grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
+
+
 def feature_matching_loss(
     disc_real_outputs: List[List[torch.Tensor]],
     disc_fake_outputs: List[List[torch.Tensor]],
