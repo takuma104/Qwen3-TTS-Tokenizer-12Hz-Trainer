@@ -41,6 +41,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
+
+try:
+    from zclip import ZClip
+
+    ZCLIP_AVAILABLE = True
+except ImportError:
+    ZCLIP_AVAILABLE = False
 from accelerate.utils import set_seed
 from safetensors.torch import load_file, save_file
 from torch.optim import AdamW
@@ -241,6 +248,27 @@ def parse_args():
         type=float,
         default=1.0,
         help="Maximum gradient norm for clipping",
+    )
+    parser.add_argument(
+        "--use_zclip",
+        action="store_true",
+        default=False,
+        help="Enable ZClip adaptive gradient clipping",
+    )
+    parser.add_argument(
+        "--zclip_alpha", type=float, default=0.97, help="ZClip EMA smoothing factor"
+    )
+    parser.add_argument(
+        "--zclip_z_thresh",
+        type=float,
+        default=2.5,
+        help="ZClip z-score threshold for spike detection",
+    )
+    parser.add_argument(
+        "--zclip_warmup_steps",
+        type=int,
+        default=25,
+        help="ZClip warmup steps for EMA initialization",
     )
 
     # GAN loss weights
@@ -691,6 +719,8 @@ def save_checkpoint(
     num_frozen: int,
     base_upsample_rates: list,
     new_upsample_rates: list,
+    zclip_g=None,
+    zclip_d=None,
     is_best: bool = False,
 ):
     """Save checkpoint (generator weights + optional discriminator + training state)."""
@@ -734,17 +764,25 @@ def save_checkpoint(
         )
 
     # Training state
-    torch.save(
-        {
-            "optimizer_g": optimizer_g.state_dict(),
-            "optimizer_d": optimizer_d.state_dict() if optimizer_d else None,
-            "scheduler_g": scheduler_g.state_dict() if scheduler_g else None,
-            "scheduler_d": scheduler_d.state_dict() if scheduler_d else None,
-            "step": step,
-            "epoch": epoch,
-        },
-        checkpoint_dir / "training_state.pt",
-    )
+    training_state_dict = {
+        "optimizer_g": optimizer_g.state_dict(),
+        "optimizer_d": optimizer_d.state_dict() if optimizer_d else None,
+        "scheduler_g": scheduler_g.state_dict() if scheduler_g else None,
+        "scheduler_d": scheduler_d.state_dict() if scheduler_d else None,
+        "step": step,
+        "epoch": epoch,
+    }
+    if zclip_g is not None:
+        training_state_dict["zclip_g"] = {
+            "mean": zclip_g.mean, "var": zclip_g.var,
+            "initialized": zclip_g.initialized, "buffer": list(zclip_g.buffer),
+        }
+    if zclip_d is not None:
+        training_state_dict["zclip_d"] = {
+            "mean": zclip_d.mean, "var": zclip_d.var,
+            "initialized": zclip_d.initialized, "buffer": list(zclip_d.buffer),
+        }
+    torch.save(training_state_dict, checkpoint_dir / "training_state.pt")
 
     # Config
     config_dict = {
@@ -960,6 +998,25 @@ def main():
         disc_params = []
         disc_dtype = next(model.parameters()).dtype
 
+    # ZClip adaptive gradient clipping
+    zclip_g = None
+    zclip_d = None
+    if args.use_zclip:
+        if not ZCLIP_AVAILABLE:
+            raise ImportError(
+                "ZClip not installed. Install with: pip install git+https://github.com/bluorion-com/ZClip.git"
+            )
+        zclip_kwargs = dict(
+            alpha=args.zclip_alpha,
+            z_thresh=args.zclip_z_thresh,
+            max_grad_norm=args.max_grad_norm,
+            warmup_steps=args.zclip_warmup_steps,
+        )
+        zclip_g = ZClip(**zclip_kwargs)
+        if args.use_gan:
+            zclip_d = ZClip(**zclip_kwargs)
+            disc_wrapper = nn.ModuleList([mpd, msd])
+
     # Initialize tracker
     if args.log_with and accelerator.is_main_process:
         tracker_config = {
@@ -1064,6 +1121,20 @@ def main():
             if args.use_gan and training_state.get("scheduler_d") and scheduler_d:
                 scheduler_d.load_state_dict(training_state["scheduler_d"])
 
+        # Restore ZClip state
+        if zclip_g is not None and training_state.get("zclip_g"):
+            zs = training_state["zclip_g"]
+            zclip_g.mean = zs["mean"]
+            zclip_g.var = zs["var"]
+            zclip_g.initialized = zs["initialized"]
+            zclip_g.buffer = list(zs["buffer"])
+        if zclip_d is not None and training_state.get("zclip_d"):
+            zs = training_state["zclip_d"]
+            zclip_d.mean = zs["mean"]
+            zclip_d.var = zs["var"]
+            zclip_d.initialized = zs["initialized"]
+            zclip_d.buffer = list(zs["buffer"])
+
         accelerator.print(f"Resumed from step {start_step}, epoch {start_epoch}")
 
     # Training loop
@@ -1159,7 +1230,10 @@ def main():
                     if accelerator.sync_gradients:
                         mpd_grad_norm = compute_grad_norm(mpd)
                         msd_grad_norm = compute_grad_norm(msd)
-                    accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
+                    if zclip_d is not None:
+                        zclip_d.step(disc_wrapper)
+                    else:
+                        accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
                     optimizer_d.step()
                     scheduler_d.step()
 
@@ -1192,7 +1266,10 @@ def main():
 
                     optimizer_d.zero_grad()
                     accelerator.backward(r1_loss_scaled)
-                    accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
+                    if zclip_d is not None:
+                        zclip_d.step(disc_wrapper)
+                    else:
+                        accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
                     optimizer_d.step()
                     # NOTE: scheduler_d.step() is NOT called here — the LR scheduler
                     # steps only on the main D loss, not on the regularization pass.
@@ -1282,8 +1359,11 @@ def main():
                 optimizer_g.zero_grad()
                 accelerator.backward(loss_g)
                 if accelerator.sync_gradients:
-                    gen_grad_norm = compute_grad_norm(model)
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    if zclip_g is not None:
+                        gen_grad_norm = zclip_g.step(model)
+                    else:
+                        gen_grad_norm = compute_grad_norm(model)
+                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer_g.step()
                 scheduler_g.step()
 
@@ -1325,6 +1405,12 @@ def main():
                                 "d/r1_loss": r1_loss_val,
                             }
                         )
+                    if zclip_g is not None:
+                        log_dict["zclip_g/ema_mean"] = zclip_g.mean if zclip_g.initialized else 0.0
+                        log_dict["zclip_g/ema_var"] = zclip_g.var if zclip_g.initialized else 0.0
+                    if zclip_d is not None:
+                        log_dict["zclip_d/ema_mean"] = zclip_d.mean if zclip_d.initialized else 0.0
+                        log_dict["zclip_d/ema_var"] = zclip_d.var if zclip_d.initialized else 0.0
                     accelerator.log(log_dict, step=global_step)
 
                     progress_bar.set_postfix(
@@ -1375,6 +1461,8 @@ def main():
                             num_frozen,
                             base_upsample_rates,
                             new_upsample_rates,
+                            zclip_g=zclip_g,
+                            zclip_d=zclip_d,
                             is_best=True,
                         )
 
@@ -1395,6 +1483,8 @@ def main():
                         num_frozen,
                         base_upsample_rates,
                         new_upsample_rates,
+                        zclip_g=zclip_g,
+                        zclip_d=zclip_d,
                     )
 
                 if args.max_train_steps and global_step >= args.max_train_steps:
@@ -1416,6 +1506,8 @@ def main():
             num_frozen,
             base_upsample_rates,
             new_upsample_rates,
+            zclip_g=zclip_g,
+            zclip_d=zclip_d,
         )
 
         if args.max_train_steps and global_step >= args.max_train_steps:
@@ -1437,6 +1529,8 @@ def main():
         num_frozen,
         base_upsample_rates,
         new_upsample_rates,
+        zclip_g=zclip_g,
+        zclip_d=zclip_d,
     )
 
     accelerator.end_training()

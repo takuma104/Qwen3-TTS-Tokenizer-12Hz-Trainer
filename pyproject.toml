@@ -34,10 +34,12 @@ dependencies = [
   "pysptk>=1.0.1",
   "pyworld>=0.3.5",
   "setuptools<=81",
+  "zclip",
 ]
 
 # third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
 [tool.uv.sources]
 flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
 utmosv2 = { git = "https://github.com/sarulab-speech/UTMOSv2.git" }
+zclip = { git = "https://github.com/bluorion-com/ZClip.git" }
 
