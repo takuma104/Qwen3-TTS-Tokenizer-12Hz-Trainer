@@ -74,6 +74,7 @@ from losses import (
     discriminator_loss,
     feature_matching_loss,
     d_r1_loss,
+    gpu_mcd,
 )
 from qwen_tts import Qwen3TTSTokenizer
 from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
@@ -584,6 +585,7 @@ def eval_step(
     msd: "nn.Module | None" = None,
     ref_mpd: "nn.Module | None" = None,
     ref_msd: "nn.Module | None" = None,
+    sample_rate: int = 48000,
     max_batches: int = 50,
 ) -> dict:
     """Evaluation (mel loss + optional discriminator stats + optional reference discriminator stats)."""
@@ -600,6 +602,7 @@ def eval_step(
     total_dg_msd = 0.0
     total_ref_dg_mpd = 0.0
     total_ref_dg_msd = 0.0
+    total_mcd = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -619,6 +622,9 @@ def eval_step(
 
             mel_loss = mel_loss_fn(pred, target)
             total_mel_loss += mel_loss.item()
+
+            mcd_val = gpu_mcd(pred, target, sample_rate=sample_rate)
+            total_mcd += mcd_val.item()
 
             pred_wav = pred.unsqueeze(1)
             target_wav = target.unsqueeze(1)
@@ -656,7 +662,10 @@ def eval_step(
         msd.train()
 
     n = max(num_batches, 1)
-    result = {"val/loss_multi_res_mel": total_mel_loss / n}
+    result = {
+        "val/loss_multi_res_mel": total_mel_loss / n,
+        "val/mcd": total_mcd / n,
+    }
     if mpd is not None and msd is not None:
         result.update(
             {
@@ -1352,6 +1361,7 @@ def main():
                         msd=msd if args.use_gan else None,
                         ref_mpd=ref_mpd,
                         ref_msd=ref_msd,
+                        sample_rate=target_sample_rate,
                     )
                     accelerator.print(
                         f"\nStep {global_step} - Validation: {val_losses}"

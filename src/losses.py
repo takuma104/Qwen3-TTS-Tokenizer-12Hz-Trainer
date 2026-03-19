@@ -5,9 +5,12 @@
 Loss Functions
 """
 
+import math
 from typing import List, Tuple
+
 import torch
 import torch.nn.functional as F
+import torchaudio.functional as AF
 
 """
 Global RMS Energy Loss in dB
@@ -108,6 +111,72 @@ def d_r1_loss(
     )
     # grad_real: (B, 1, T)
     return grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
+
+
+def gpu_mcd(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    sample_rate: int,
+    order: int = 24,
+) -> torch.Tensor:
+    """GPU-approximate Mel Cepstral Distortion in dB (lower is better).
+
+    Replaces WORLD + pysptk with STFT → mel filterbank → DCT-II.
+    Values correlate with but are not identical to the CPU WORLD-based MCD.
+
+    Args:
+        pred: Predicted waveform [B, T]
+        target: Target waveform [B, T]
+        sample_rate: Audio sample rate in Hz
+        order: Cepstral order (default 24, matching CPU implementation)
+
+    Returns:
+        Scalar MCD value in dB.
+    """
+    hop_length = sample_rate // 200  # 5ms frames
+    win_length = sample_rate // 40   # 25ms window
+    n_fft = 2048 if sample_rate >= 32000 else 1024
+    n_mels = order + 1  # 25 mel bands → c0..c24
+
+    window = torch.hann_window(win_length, device=pred.device, dtype=pred.dtype)
+
+    def _mcep(x: torch.Tensor) -> torch.Tensor:
+        spec = torch.stft(
+            x, n_fft, hop_length, win_length, window, return_complex=True
+        )
+        power = spec.abs().pow(2)  # [B, n_fft//2+1, T_frames]
+
+        mel_fb = AF.melscale_fbanks(
+            n_freqs=n_fft // 2 + 1,
+            f_min=0.0,
+            f_max=sample_rate / 2.0,
+            n_mels=n_mels,
+            sample_rate=sample_rate,
+        ).to(device=pred.device, dtype=pred.dtype)  # [n_fft//2+1, n_mels]
+
+        mel_power = power.transpose(-1, -2) @ mel_fb  # [B, T_frames, n_mels]
+        log_mel = torch.log(mel_power.clamp(min=1e-10))
+
+        # DCT-II matrix
+        n = torch.arange(n_mels, device=pred.device, dtype=pred.dtype)
+        k = torch.arange(n_mels, device=pred.device, dtype=pred.dtype)
+        dct_mat = torch.cos(math.pi * k.unsqueeze(1) * (n.unsqueeze(0) + 0.5) / n_mels)
+        # [n_mels, n_mels]
+
+        return log_mel @ dct_mat.T  # [B, T_frames, n_mels]
+
+    mcep_pred = _mcep(pred)
+    mcep_target = _mcep(target)
+
+    min_frames = min(mcep_pred.shape[1], mcep_target.shape[1])
+    if min_frames == 0:
+        return pred.new_tensor(float("nan"))
+
+    # Exclude c0 (index 0)
+    diff = mcep_pred[:, :min_frames, 1:] - mcep_target[:, :min_frames, 1:]
+    frame_dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-16)
+    mcd = (10.0 * math.sqrt(2.0) / math.log(10.0)) * frame_dist.mean()
+    return mcd
 
 
 def feature_matching_loss(
