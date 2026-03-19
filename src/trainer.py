@@ -342,6 +342,17 @@ def parse_args():
     )
     parser.add_argument("--wandb_entity", type=str, default=None, help="WandB entity")
 
+    # Reference discriminator checkpoint
+    parser.add_argument(
+        "--ref_discriminator_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint directory containing discriminator.pt. "
+            "Loads frozen reference MPD/MSD and logs their dg scores in eval_step."
+        ),
+    )
+
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -571,9 +582,11 @@ def eval_step(
     accelerator: Accelerator,
     mpd: "nn.Module | None" = None,
     msd: "nn.Module | None" = None,
+    ref_mpd: "nn.Module | None" = None,
+    ref_msd: "nn.Module | None" = None,
     max_batches: int = 50,
 ) -> dict:
-    """Evaluation (mel loss + optional discriminator stats)."""
+    """Evaluation (mel loss + optional discriminator stats + optional reference discriminator stats)."""
     model.eval()
     if mpd is not None:
         mpd.eval()
@@ -585,6 +598,8 @@ def eval_step(
     total_dg_mpd = 0.0
     total_dr_msd = 0.0
     total_dg_msd = 0.0
+    total_ref_dg_mpd = 0.0
+    total_ref_dg_msd = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -605,11 +620,11 @@ def eval_step(
             mel_loss = mel_loss_fn(pred, target)
             total_mel_loss += mel_loss.item()
 
+            pred_wav = pred.unsqueeze(1)
+            target_wav = target.unsqueeze(1)
+
             # Discriminator d_r / d_g stats
             if mpd is not None and msd is not None:
-                pred_wav = pred.unsqueeze(1)
-                target_wav = target.unsqueeze(1)
-
                 _, dr_mpd, dg_mpd = discriminator_loss(
                     mpd(target_wav), mpd(pred_wav)
                 )
@@ -620,6 +635,17 @@ def eval_step(
                 total_dg_mpd += dg_mpd.item()
                 total_dr_msd += dr_msd.item()
                 total_dg_msd += dg_msd.item()
+
+            # Reference discriminator d_g stats
+            if ref_mpd is not None and ref_msd is not None:
+                _, _, ref_dg_mpd = discriminator_loss(
+                    ref_mpd(target_wav), ref_mpd(pred_wav)
+                )
+                _, _, ref_dg_msd = discriminator_loss(
+                    ref_msd(target_wav), ref_msd(pred_wav)
+                )
+                total_ref_dg_mpd += ref_dg_mpd.item()
+                total_ref_dg_msd += ref_dg_msd.item()
 
             num_batches += 1
 
@@ -638,6 +664,13 @@ def eval_step(
                 "val/d_mpd/dg": total_dg_mpd / n,
                 "val/d_msd/dr": total_dr_msd / n,
                 "val/d_msd/dg": total_dg_msd / n,
+            }
+        )
+    if ref_mpd is not None and ref_msd is not None:
+        result.update(
+            {
+                "val/ref_d_mpd/dg": total_ref_dg_mpd / n,
+                "val/ref_d_msd/dg": total_ref_dg_msd / n,
             }
         )
     return result
@@ -770,6 +803,30 @@ def main():
     else:
         mpd, msd = None, None
         accelerator.print("GAN disabled: skipping discriminator creation.")
+
+    # Create reference discriminators (frozen, for eval logging)
+    ref_mpd, ref_msd = None, None
+    if args.ref_discriminator_checkpoint:
+        ref_disc_path = Path(args.ref_discriminator_checkpoint) / "discriminator.pt"
+        if ref_disc_path.exists():
+            ref_mpd, ref_msd = create_discriminators(accelerator)
+            disc_state = torch.load(ref_disc_path, map_location="cpu")
+            ref_mpd.load_state_dict(disc_state["mpd"])
+            ref_msd.load_state_dict(disc_state["msd"])
+            ref_mpd.to(accelerator.device).eval()
+            ref_msd.to(accelerator.device).eval()
+            for p in ref_mpd.parameters():
+                p.requires_grad_(False)
+            for p in ref_msd.parameters():
+                p.requires_grad_(False)
+            accelerator.print(
+                f"Loaded reference discriminators from {ref_disc_path}"
+            )
+        else:
+            accelerator.print(
+                f"WARNING: ref_discriminator_checkpoint specified but "
+                f"{ref_disc_path} not found. Skipping reference discriminators."
+            )
 
     # Mel loss (reconstruction component)
     target_sample_rate = BASE_SAMPLE_RATE * (
@@ -1281,6 +1338,8 @@ def main():
                         accelerator,
                         mpd=mpd if args.use_gan else None,
                         msd=msd if args.use_gan else None,
+                        ref_mpd=ref_mpd,
+                        ref_msd=ref_msd,
                     )
                     accelerator.print(
                         f"\nStep {global_step} - Validation: {val_losses}"
