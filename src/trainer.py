@@ -999,11 +999,20 @@ def main():
             accelerator.unwrap_model(msd).load_state_dict(disc_state["msd"])
 
         # Load training state
-        training_state = torch.load(
-            checkpoint_dir / "training_state.pt", map_location="cpu"
-        )
-        start_step = training_state["step"]
-        start_epoch = training_state["epoch"]
+        start_step = 0
+        start_epoch = 0
+        training_state_path = checkpoint_dir / "training_state.pt"
+        if not training_state_path.exists():
+            accelerator.print(
+                f"WARNING: training_state.pt not found in {checkpoint_dir}. "
+                f"Cannot resume optimizer/scheduler state or step/epoch count."
+            )
+        else:
+            training_state = torch.load(
+                training_state_path, map_location="cpu"
+            )
+            start_step = training_state["step"]
+            start_epoch = training_state["epoch"]
 
         if not args.no_resume_optimizer:
             if not num_frozen_changed:
