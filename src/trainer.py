@@ -1121,19 +1121,19 @@ def main():
             if args.use_gan and training_state.get("scheduler_d") and scheduler_d:
                 scheduler_d.load_state_dict(training_state["scheduler_d"])
 
-        # Restore ZClip state
-        if zclip_g is not None and training_state.get("zclip_g"):
-            zs = training_state["zclip_g"]
-            zclip_g.mean = zs["mean"]
-            zclip_g.var = zs["var"]
-            zclip_g.initialized = zs["initialized"]
-            zclip_g.buffer = list(zs["buffer"])
-        if zclip_d is not None and training_state.get("zclip_d"):
-            zs = training_state["zclip_d"]
-            zclip_d.mean = zs["mean"]
-            zclip_d.var = zs["var"]
-            zclip_d.initialized = zs["initialized"]
-            zclip_d.buffer = list(zs["buffer"])
+            # Restore ZClip state
+            if zclip_g is not None and training_state.get("zclip_g"):
+                zs = training_state["zclip_g"]
+                zclip_g.mean = zs["mean"]
+                zclip_g.var = zs["var"]
+                zclip_g.initialized = zs["initialized"]
+                zclip_g.buffer = list(zs["buffer"])
+            if zclip_d is not None and training_state.get("zclip_d"):
+                zs = training_state["zclip_d"]
+                zclip_d.mean = zs["mean"]
+                zclip_d.var = zs["var"]
+                zclip_d.initialized = zs["initialized"]
+                zclip_d.buffer = list(zs["buffer"])
 
         accelerator.print(f"Resumed from step {start_step}, epoch {start_epoch}")
 
