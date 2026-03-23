@@ -9,22 +9,19 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets/val/*.tar"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
-RUN_NUMBER=23
+RUN_NUMBER=26
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards "${VAL_SHARDS}" \
     --output_dir "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     --ref_discriminator_checkpoint "${OUTPUT_DIR}/run10/checkpoint-best-disc" \
-    --resume_from "${OUTPUT_DIR}/run10/checkpoint-best-disc" \
-    --no_resume_optimizer \
     --batch_size 8 \
     --train_full_decoder \
-    --num_decoder_block_frozen 0 \
     --d_reg_every 16 \
     --use_zclip \
-    --lr_g 1e-4 \
-    --lr_d 2e-4 \
+    --lr_g 5e-5 \
+    --lr_d 1e-4 \
     --beta2_d 0.9 \
     --warmup_steps 100000 \
     --max_train_steps 1000000 \
